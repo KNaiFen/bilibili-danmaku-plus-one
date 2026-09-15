@@ -6,6 +6,17 @@ async (page) => {
     results.push(message);
   };
   page.on('pageerror', error => errors.push(error.message));
+  await page.addInitScript(() => {
+    window.scriptMenus = [];
+    window.GM_registerMenuCommand = (label, command) => scriptMenus.push({ label, command });
+    const storedKey = 'test-gm-plus1_toast_enabled';
+    if (localStorage.getItem(storedKey) === null) localStorage.setItem(storedKey, 'false');
+    window.GM_getValue = (key, fallback) => {
+      const raw = localStorage.getItem('test-gm-' + key);
+      return raw === null ? fallback : JSON.parse(raw);
+    };
+    window.GM_setValue = (key, value) => localStorage.setItem('test-gm-' + key, JSON.stringify(value));
+  });
   await page.route('**/*', route => route.abort());
   await page.route('http://127.0.0.1:19222/123', route => route.fulfill({
     contentType: 'text/html',
@@ -14,6 +25,78 @@ async (page) => {
   await page.route('**/danmaku-v2.js', route => route.fulfill({ contentType: 'application/javascript', path: 'generated/test-engine.js' }));
   await page.goto('http://127.0.0.1:19222/123');
   await page.addScriptTag({ path: 'bilibili-danmaku-plus-one.user.js' });
+  const settings = page.locator('#danmaku-plus1-settings dialog');
+  const successToggle = settings.getByRole('switch', { name: '复读成功提示' });
+  const openSettings = () => page.evaluate(() => scriptMenus[0].command());
+  const assertSettingsBounds = async label => {
+    check(await settings.evaluate(dialog => {
+      const rect = dialog.getBoundingClientRect();
+      return rect.width > 0 && rect.left >= 0 && rect.top >= 0
+        && rect.right <= innerWidth && rect.bottom <= innerHeight
+        && dialog.scrollWidth <= dialog.clientWidth
+        && [...dialog.querySelectorAll('button, input')].every(control => {
+          const bounds = control.getBoundingClientRect();
+          return bounds.left >= rect.left && bounds.right <= rect.right
+            && bounds.top >= rect.top && bounds.bottom <= rect.bottom;
+        });
+    }), label);
+  };
+  check(await page.evaluate(() => scriptMenus.length === 1 && scriptMenus[0].label === '[Danmaku +1] 设置'),
+    'userscript menu contains only the settings entry');
+  check(await page.locator('#danmaku-plus1-settings').count() === 0,
+    'settings has no permanent page button and is created only when opened');
+  await page.evaluate(() => {
+    const focusTarget = document.createElement('button');
+    focusTarget.id = 'settings-focus-target';
+    focusTarget.textContent = 'Focus target';
+    document.body.appendChild(focusTarget);
+    focusTarget.focus();
+    window.settingsPageClicks = 0;
+    window.settingsPageKeys = 0;
+    document.addEventListener('click', () => settingsPageClicks++);
+    window.addEventListener('keydown', () => settingsPageKeys++);
+  });
+  await openSettings();
+  check(await settings.isVisible() && !await successToggle.isChecked(),
+    'menu opens the modal and preserves the existing disabled preference');
+  await openSettings();
+  check(await page.locator('#danmaku-plus1-settings').count() === 1,
+    'reopening settings does not create duplicate panels');
+  await assertSettingsBounds('desktop settings panel and controls fit the viewport');
+  await page.screenshot({ path: 'output/playwright/settings-desktop.png' });
+  await successToggle.focus();
+  await successToggle.press('Space');
+  check(await successToggle.isChecked() && await page.evaluate(() => GM_getValue('plus1_toast_enabled', false)),
+    'keyboard toggle immediately saves the preference');
+  await successToggle.press('Tab');
+  check(await settings.getByRole('button', { name: '关闭设置' }).evaluate(button => button.getRootNode().activeElement === button),
+    'Tab stays inside the modal');
+  await settings.getByRole('button', { name: '关闭设置' }).click();
+  check(!await settings.isVisible() && await page.evaluate(() => document.activeElement.id === 'settings-focus-target'),
+    'close button closes the panel and restores previous focus');
+  await openSettings();
+  check(await successToggle.isChecked(), 'reopening shows the saved preference');
+  await successToggle.click();
+  await page.keyboard.press('Escape');
+  check(!await settings.isVisible(), 'Escape closes settings');
+  await openSettings();
+  await page.mouse.click(8, 8);
+  check(!await settings.isVisible() && await page.evaluate(() => settingsPageClicks === 0 && settingsPageKeys === 0),
+    'backdrop closes settings without clicks or keyboard shortcuts reaching the page');
+  await openSettings();
+  for (const viewport of [{ width: 320, height: 568 }, { width: 640, height: 180 }]) {
+    await page.setViewportSize(viewport);
+    await assertSettingsBounds(`settings stays inside a ${viewport.width}x${viewport.height} viewport`);
+    if (viewport.width === 320) await page.screenshot({ path: 'output/playwright/settings-mobile.png' });
+  }
+  await page.keyboard.press('Escape');
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.reload();
+  await page.addScriptTag({ path: 'bilibili-danmaku-plus-one.user.js' });
+  await openSettings();
+  check(!await successToggle.isChecked(), 'saved preference survives a page reload');
+  await successToggle.click();
+  await page.keyboard.press('Escape');
   await page.addScriptTag({ url: 'http://127.0.0.1:19222/danmaku-v2.js' });
   await page.evaluate(() => {
     window.engine = new LiveDanmakuEngine.default(document.getElementById('layer'), { userId: 0, isMobile: false, rnd: 'test' });
@@ -333,6 +416,9 @@ async (page) => {
   await toolbar.locator('[data-action="repeat"]').click();
   await page.waitForFunction(() => sent.length === 1);
   check(await page.evaluate(() => sent[0] === '浮窗复制和复读 [表情]' && playerClicks === 0), 'toolbar repeat sends correct text without clicking the player');
+  check(await page.evaluate(() => [...document.body.children].some(element =>
+    element.textContent === '弹幕+1成功' && element.style.opacity === '1')),
+  'enabled setting shows the success toast after repeating');
   await page.waitForTimeout(3300);
   check(!!(await state('浮窗复制和复读 [表情]'))?.hover, 'toolbar hover protects fixed danmaku past its expiration');
   await page.screenshot({ path: 'output/playwright/toolbar-top.png' });
@@ -526,7 +612,35 @@ async (page) => {
   check(await page.evaluate(() => document.fullscreenElement.contains(document.getElementById('danmaku-plus1-toolbar'))), 'toolbar remains in the fullscreen player DOM');
   await assertBounds('fullscreen toolbar is visible and clickable');
   await page.screenshot({ path: 'output/playwright/toolbar-fullscreen.png' });
+  await openSettings();
+  await page.waitForFunction(() => !dmState('全屏弹幕')?.hover && document.getElementById('danmaku-plus1-toolbar').hidden);
+  check(await settings.isVisible() && await page.evaluate(() =>
+    document.fullscreenElement.contains(document.getElementById('danmaku-plus1-settings'))),
+  'opening settings in fullscreen releases hovered danmaku and displays the modal above the player');
+  await assertSettingsBounds('fullscreen settings controls remain visible and reachable');
+  await page.screenshot({ path: 'output/playwright/settings-fullscreen.png' });
+  const clicksBeforeSettings = await page.evaluate(() => playerClicks);
+  await successToggle.click();
+  check(await page.evaluate(() => playerClicks) === clicksBeforeSettings,
+    'changing a setting inside the fullscreen player does not click the player');
   await page.evaluate(() => document.exitFullscreen());
+  await page.waitForFunction(() => {
+    const host = document.getElementById('danmaku-plus1-settings');
+    return host.parentElement === document.body && host.shadowRoot.querySelector('dialog').open;
+  });
+  check(await settings.isVisible() && !await successToggle.isChecked(),
+    'exiting fullscreen keeps settings open with the current preference');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(1300);
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => { engine.danmaku.core.clear(); addDm('关闭成功提示测试', 5); });
+  await awaitToolbar('关闭成功提示测试');
+  const sendsBeforeSettings = await page.evaluate(() => sent.length);
+  await toolbar.locator('[data-action="repeat"]').click();
+  await page.waitForFunction(count => sent.length === count + 1, sendsBeforeSettings);
+  check(await page.evaluate(() => ![...document.body.children].some(element =>
+    element.textContent === '弹幕+1成功' && element.style.opacity === '1')),
+  'disabled setting suppresses success toasts immediately without stopping repeat');
   check(errors.length === 0, 'no uncaught JavaScript errors');
   return { passed: results.length, results };
 }

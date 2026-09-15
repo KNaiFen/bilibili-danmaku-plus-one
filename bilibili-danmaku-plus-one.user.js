@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕一键 复读+1 浮窗
 // @namespace    https://greasyfork.org/
-// @version      1.4.2
+// @version      1.5.0
 // @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗
 // @author       You
 // @match        https://live.bilibili.com/*
@@ -39,6 +39,7 @@
   let toastEnabled = true;
   let toastTimer = 0;
   let toastEl = null;
+  let settingsDialog = null;
 
   initMenu();
   initDanmakuHover();
@@ -515,6 +516,10 @@
     }
 
     function checkHover() {
+      if (settingsDialog?.open) {
+        release();
+        return;
+      }
       if (replying) return;
       if (held) {
         const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
@@ -605,15 +610,141 @@
 
   function initMenu() {
     toastEnabled = getStoredBool(TOAST_TOGGLE_KEY, true);
-    const label = toastEnabled
-      ? '[Danmaku +1] 关闭成功提示'
-      : '[Danmaku +1] 开启成功提示';
-    registerMenuCommandSafe(label, () => {
-      toastEnabled = !toastEnabled;
+    registerMenuCommandSafe('[Danmaku +1] 设置', openSettings);
+  }
+
+  function openSettings() {
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', openSettings, { once: true });
+      return;
+    }
+    if (!settingsDialog) createSettingsDialog();
+    const host = settingsDialog.getRootNode().host;
+    const parent = document.fullscreenElement || document.body;
+    if (host.parentElement !== parent) parent.appendChild(host);
+    settingsDialog.querySelector('[name="successToast"]').checked = toastEnabled;
+    if (!settingsDialog.open) settingsDialog.showModal();
+  }
+
+  function createSettingsDialog() {
+    // Isolate the panel from player styles; the native modal supplies focus
+    // containment and makes the page behind it inert, including in fullscreen.
+    const host = document.createElement('div');
+    host.id = 'danmaku-plus1-settings';
+    const root = host.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = `
+      :host { all:initial; }
+      * { box-sizing:border-box; letter-spacing:0; }
+      dialog { position:fixed; inset:0; margin:auto; padding:0;
+        width:400px; max-width:calc(100vw - 32px); max-height:calc(100vh - 32px);
+        max-height:calc(100dvh - 32px); overflow:auto; overscroll-behavior:contain;
+        border:1px solid rgba(255,255,255,.16); border-radius:8px;
+        background:rgba(38,39,42,.96); color:#f1f1f1; color-scheme:dark;
+        box-shadow:0 12px 40px rgba(0,0,0,.25);
+        font:14px/1.5 Arial,"Microsoft YaHei",sans-serif; text-shadow:none; }
+      dialog::backdrop { background:rgba(0,0,0,.3); }
+      header { display:flex; align-items:center; justify-content:space-between;
+        gap:12px; padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.1); }
+      h2 { margin:0; font-size:16px; font-weight:600; overflow-wrap:anywhere; }
+      button { display:grid; place-items:center; flex:none; width:28px; height:28px;
+        padding:0; border:0; border-radius:4px; background:transparent;
+        color:#bbb; font:24px/1 Arial,sans-serif; cursor:pointer; }
+      button:hover { background:rgba(255,255,255,.1); color:#fff; }
+      button:focus-visible, input:focus-visible { outline:2px solid #00aeec; outline-offset:3px; }
+      .settings-content { padding:4px 16px; }
+      .setting-row { display:flex; align-items:center; justify-content:space-between;
+        gap:20px; min-height:56px; padding:12px 0; cursor:pointer; }
+      .setting-row + .setting-row { border-top:1px solid rgba(255,255,255,.08); }
+      .setting-row span { min-width:0; overflow-wrap:anywhere; }
+      input[type="checkbox"] { appearance:none; position:relative; flex:none;
+        width:34px; height:20px; margin:0; border:1px solid rgba(255,255,255,.2);
+        border-radius:10px; background:#54565b; cursor:pointer; }
+      input[type="checkbox"]::before { content:""; position:absolute; left:3px; top:3px;
+        width:12px; height:12px; border-radius:50%; background:#fff; }
+      input[type="checkbox"]:checked { background:#00aeec; border-color:#00aeec; }
+      input[type="checkbox"]:checked::before { transform:translateX(14px); }
+    `;
+    settingsDialog = document.createElement('dialog');
+    settingsDialog.setAttribute('aria-labelledby', 'settings-title');
+    const header = document.createElement('header');
+    const title = document.createElement('h2');
+    title.id = 'settings-title';
+    title.textContent = '弹幕 +1 设置';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '\u00d7';
+    close.title = '关闭';
+    close.setAttribute('aria-label', '关闭设置');
+    close.addEventListener('click', () => settingsDialog.close());
+    header.append(title, close);
+
+    const content = document.createElement('div');
+    content.className = 'settings-content';
+    const row = document.createElement('label');
+    row.className = 'setting-row';
+    const label = document.createElement('span');
+    label.textContent = '复读成功提示';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.name = 'successToast';
+    toggle.setAttribute('role', 'switch');
+    toggle.addEventListener('change', () => {
+      toastEnabled = toggle.checked;
       setStoredBool(TOAST_TOGGLE_KEY, toastEnabled);
-      const msg = toastEnabled ? '已开启：弹幕+1成功提示' : '已关闭：弹幕+1成功提示';
-      console.info(`[Danmaku +1] ${msg}`);
-      showToast(msg);
+    });
+    row.append(label, toggle);
+    content.appendChild(row);
+    settingsDialog.append(header, content);
+    root.append(style, settingsDialog);
+
+    let backdropDown = false;
+    const outside = (event) => {
+      const rect = settingsDialog.getBoundingClientRect();
+      return event.clientX < rect.left || event.clientX > rect.right
+        || event.clientY < rect.top || event.clientY > rect.bottom;
+    };
+    settingsDialog.addEventListener('pointerdown', event => { backdropDown = outside(event); });
+    settingsDialog.addEventListener('click', event => {
+      if (backdropDown && outside(event)) settingsDialog.close();
+      backdropDown = false;
+    });
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel']) {
+      root.addEventListener(type, event => event.stopPropagation());
+    }
+    // Player keyboard shortcuts must not run while changing a setting.
+    for (const type of ['keydown', 'keyup']) {
+      window.addEventListener(type, event => {
+        if (!settingsDialog.open) return;
+        event.stopImmediatePropagation();
+        if (type === 'keydown' && event.key === 'Escape') {
+          event.preventDefault();
+          settingsDialog.close();
+        } else if (type === 'keydown' && event.key === 'Tab') {
+          const controls = Array.from(settingsDialog.querySelectorAll(
+            'button, input, select, textarea, a[href], [tabindex]'
+          )).filter(element => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length);
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && root.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && root.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }
+      }, true);
+    }
+    document.addEventListener('fullscreenchange', () => {
+      const wasOpen = settingsDialog.open;
+      const focused = root.activeElement;
+      if (wasOpen) settingsDialog.close();
+      (document.fullscreenElement || document.body).appendChild(host);
+      if (wasOpen) {
+        openSettings();
+        focused?.focus();
+      }
     });
   }
 
