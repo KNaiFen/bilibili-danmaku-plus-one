@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕一键 复读+1 浮窗
 // @namespace    https://greasyfork.org/
-// @version      1.6.0
-// @description  B站直播弹幕悬停、回复、复制与一键复读，支持按弹幕数量自动复读
+// @version      1.6.1
+// @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗
 // @author       You
 // @match        https://live.bilibili.com/*
 // @run-at       document-start

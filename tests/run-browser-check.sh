@@ -7,7 +7,7 @@ if [ "${#engines[@]}" -ne 1 ]; then
   printf '%s\n' 'Expected one saved danmaku-v2.js file under .example/*_files/.' >&2
   exit 1
 fi
-mkdir -p generated output/playwright
+mkdir -p generated
 cp -- "${engines[0]}" generated/test-engine.js
 pwcli() {
   if [ -n "${PWCLI:-}" ]; then
