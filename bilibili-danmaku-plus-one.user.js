@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.3.1
-// @description  悬停暂停单条直播弹幕并显示复制、复读浮窗；支持右键菜单+1复读
+// @version      1.4.0
+// @description  悬停暂停单条直播弹幕并显示回复、复制、复读浮窗；回复复用B站原生@TA
 // @author       You
 // @match        https://live.bilibili.com/*
 // @run-at       document-start
@@ -145,6 +145,83 @@
     }
   }
 
+  function getReplyInfo(data) {
+    const modeInfo = data.modeInfo || {};
+    let extra = modeInfo._extra;
+    if (!extra || typeof extra !== 'object') {
+      try { extra = JSON.parse(modeInfo.extra || '{}'); } catch (_) { extra = {}; }
+    }
+    const uid = Number(data.uid);
+    const username = String(data.uname || '').trim();
+    if (!/^[1-9]\d*$/.test(String(data.uid || '')) || !Number.isSafeInteger(uid) || !username) {
+      return { reason: '未获取到发送者信息' };
+    }
+    const isMystery = !!modeInfo.user?.base?.is_mystery;
+    if (isMystery) return { reason: '该发送者暂不支持回复' };
+    if (extra?.show_reply !== true && extra?.show_reply !== 1) {
+      return { reason: '该弹幕暂不支持回复' };
+    }
+    return { info: { uid, username, content: String(data.text || ''),
+      ts: data.checkInfo?.ts || 0, sign: data.checkInfo?.ct || '',
+      dmType: data.dmType || 0, fileId: '', imgUrl: '',
+      idStr: String(data.id_str || data.dmid || ''), showReply: true, isMystery,
+      isUniLiveDanmaku: !!extra?.is_mirror,
+      originAnchorName: extra?.origin_anchor_name || '',
+      originRoomInfo: extra?.origin_room_info || '' } };
+  }
+
+  function findNativeReplyMenu() {
+    const pageWindow = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    const seen = new Set();
+    for (const element of pageWindow.document.querySelectorAll('.danmaku-menu, #danmaku-menu-vm')) {
+      for (let vm = element.__vue__; vm && !seen.has(vm); vm = vm.$parent) {
+        seen.add(vm);
+        if (!vm._isDestroyed && vm.danmakuMenuInfo && typeof vm.showMenu === 'function'
+          && typeof vm.hideMenu === 'function') return vm;
+      }
+    }
+    return null;
+  }
+
+  async function replyDanmaku(info, point) {
+    const menu = findNativeReplyMenu();
+    if (!menu) {
+      showToast('未找到B站回复菜单，请刷新直播间后重试');
+      return;
+    }
+    const matches = (value) => value && String(value.uid) === String(info.uid)
+      && value.username === info.username && value.content === info.content
+      && String(value.idStr || '') === info.idStr;
+    let openError = null;
+    try {
+      // This is the same controller used by the chat list. Its component owns
+      // @TA, login checks and reply state; never replace it with plain @ text.
+      Promise.resolve(menu.showMenu(point.x, point.y, info)).catch(error => { openError = error; });
+      const deadline = performance.now() + 2500;
+      while (performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        if (openError) throw openError;
+        if (!menu.show || !matches(menu.danmakuMenuInfo)) return;
+        const component = menu.$children?.find(child =>
+          !child._isDestroyed && child.$el?.matches?.('.danmaku-menu') && matches(child.info));
+        // Wait for Vue to render this selection, so a stale @TA cannot reply to
+        // the previous user while the component is loading or updating.
+        const action = component?.$el.querySelector('.at-this-guy');
+        if (!action?.getClientRects().length || getComputedStyle(action).visibility !== 'visible') continue;
+        const button = action.querySelector('a, button') || action;
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') break;
+        button.click();
+        return;
+      }
+      showToast('B站未提供该弹幕的@TA操作');
+    } catch (error) {
+      console.error('[Danmaku +1] Reply failed:', error);
+      showToast('回复失败，请重试');
+    } finally {
+      if (menu.show && matches(menu.danmakuMenuInfo)) menu.hideMenu();
+    }
+  }
+
   function closeContextMenu() {
     // Do not mutate menu DOM directly; let page logic close it to avoid stuck state.
     const clickTarget = document.body || document.documentElement;
@@ -204,6 +281,7 @@
     let toolbarBridge = null;
     let toolbarOwner = null;
     let toolbarStyle = null;
+    let replying = false;
 
     function ensureToolbar(engine) {
       if (!toolbar) {
@@ -238,8 +316,7 @@
           button.type = 'button';
           button.dataset.action = action;
           button.textContent = label;
-          button.title = action === 'reply' ? '回复（暂未开放）' : label;
-          button.disabled = action === 'reply';
+          button.title = label;
           toolbar.appendChild(button);
         }
         toolbarLayer.appendChild(toolbar);
@@ -255,6 +332,18 @@
           const button = event.target.closest('button');
           const owner = held;
           if (!button || !owner || button.disabled) return;
+          if (button.dataset.action === 'reply') {
+            if (replying || !owner.reply.info) return;
+            const rect = toolbar.getBoundingClientRect();
+            replying = true;
+            release();
+            try {
+              await replyDanmaku(owner.reply.info, { x: rect.left, y: rect.top });
+            } finally {
+              replying = false;
+            }
+            return;
+          }
           const text = String(owner.dm.textData.text || '').trim();
           if (!text) return;
           button.disabled = true;
@@ -278,6 +367,9 @@
       if (toolbarOwner !== held) {
         toolbarOwner = held;
         toolbar.querySelector('[data-action="copy"]').textContent = '复制';
+        const reply = toolbar.querySelector('[data-action="reply"]');
+        reply.disabled = !held.reply.info;
+        reply.title = held.reply.reason || `回复 @${held.reply.info.username}`;
       }
     }
 
@@ -393,7 +485,8 @@
       dm.mouseEnter();
       dm.shouldDestroy = preventExpiry;
       held = { dm, manager, element, times, ownShouldDestroy, preventExpiry,
-        startedAt: manager.renderTime, anchorX: pointer.x, leaveAt: 0 };
+        startedAt: manager.renderTime, anchorX: pointer.x, leaveAt: 0,
+        reply: getReplyInfo(dm.textData) };
     }
 
     function keepForContextMenu(engine) {
@@ -428,6 +521,7 @@
     }
 
     function checkHover() {
+      if (replying) return;
       if (held) {
         const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
         if (engine && held.manager.visualArray.includes(held.dm)

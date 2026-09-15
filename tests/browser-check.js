@@ -265,7 +265,7 @@ async (page) => {
   };
   const toolbarDm = await awaitToolbar('浮窗复制和复读 [表情]');
   check(await toolbar.getAttribute('data-placement') === 'bottom', 'toolbar appears below top danmaku');
-  check(await toolbar.locator('[data-action="reply"]').isDisabled(), 'reply is a disabled placeholder');
+  check(await toolbar.locator('[data-action="reply"]').isDisabled(), 'reply is disabled when sender data is missing');
   await assertBounds('toolbar and all three buttons are visible and clickable inside the player');
   const barRect = await toolbar.boundingBox();
   await page.mouse.move(barRect.x + barRect.width / 2, (toolbarDm.y + toolbarDm.height + barRect.y) / 2);
@@ -315,6 +315,119 @@ async (page) => {
     await page.mouse.move(1100, 600);
     await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
   }
+
+  await page.evaluate(() => {
+    // The saved HTML omits the lazy-loaded menu JS. Model its Vue controller
+    // contract from app.js and keep using the real saved danmaku engine.
+    const menuEl = document.createElement('div');
+    menuEl.className = 'danmaku-menu';
+    menuEl.style.cssText = 'position:fixed;left:980px;top:100px;display:none';
+    menuEl.innerHTML = '<div class="at-this-guy"><a>@TA</a></div>';
+    const input = document.createElement('textarea');
+    input.id = 'native-reply-input';
+    input.value = 'draft stays unchanged';
+    document.body.append(menuEl, input);
+    window.replyTargets = [];
+    window.nativeMenuOpens = [];
+    window.omitNativeAt = false;
+    const child = { $el: menuEl, info: { uid: 999, username: 'Previous sender', content: 'old', idStr: 'old' } };
+    let revision = 0;
+    const menu = window.nativeReplyMenu = {
+      $children: [child], show: false, danmakuMenuInfo: {},
+      showMenu(x, y, info) {
+        const current = ++revision;
+        nativeMenuOpens.push({ ...info });
+        this.show = true;
+        this.danmakuMenuInfo = info;
+        menuEl.style.display = '';
+        // Leave the previous component props visible until Vue catches up.
+        setTimeout(() => {
+          if (current !== revision) return;
+          child.info = info;
+          menuEl.querySelector('.at-this-guy').style.display = omitNativeAt ? 'none' : '';
+        }, 160);
+      },
+      hideMenu() { this.show = false; menuEl.style.display = 'none'; ++revision; }
+    };
+    child.$parent = menu;
+    menuEl.__vue__ = child;
+    menuEl.querySelector('a').addEventListener('click', () => {
+      replyTargets.push({ ...child.info });
+      input.dataset.replyUid = child.info.uid;
+      input.focus();
+      menu.hideMenu();
+    });
+    window.addReplyDm = (id, uid = 12345, extra = { show_reply: true }, mystery = false) => {
+      engine.danmaku.core.clear();
+      const info = [
+        [0, 5, 25, 16777215, 0, 777, 0, 0, 0, 0, 0, '', 0, {}, null,
+          { extra: JSON.stringify({ ...extra, id_str: id }), user: { base: { is_mystery: mystery } } }],
+        '同一条弹幕', [uid, 'Sender ' + uid, 0, 0, 0, 0, 0], [], [1], [], 0, 0, 0,
+        { ts: 123, ct: 'test-sign' }
+      ];
+      engine.handleSocketMessage({ cmd: 'DANMU_MSG', info });
+    };
+    addReplyDm('reply-first');
+  });
+  const replyButton = toolbar.locator('[data-action="reply"]');
+  await awaitToolbar('reply-first');
+  check(await replyButton.isEnabled(), 'socket sender UID, nickname and reply flags survive the real engine');
+  check(await replyButton.getAttribute('title') === '回复 @Sender 12345', 'reply tooltip identifies the actual sender');
+  await replyButton.click();
+  await page.waitForFunction(() => replyTargets.length === 1);
+  check(await page.evaluate(() => replyTargets[0].uid === 12345 && replyTargets[0].idStr === 'reply-first'
+    && replyTargets[0].ts === 123 && replyTargets[0].sign === 'test-sign'), 'reply waits for native menu props and invokes @TA with the exact sender and message');
+  check(await page.evaluate(() => document.activeElement.id === 'native-reply-input'
+    && document.activeElement.value === 'draft stays unchanged' && sent.length === 1 && playerClicks === 0),
+  'native @TA owns input focus without sending, changing the draft or clicking the player');
+  check(!(await state('reply-first'))?.hover, 'reply releases the danmaku and hides the hover toolbar');
+
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => addReplyDm('reply-second', 67890));
+  await awaitToolbar('reply-second');
+  await replyButton.click();
+  await page.waitForFunction(() => replyTargets.length === 2);
+  check(await page.evaluate(() => replyTargets[1].uid === 67890 && replyTargets[1].idStr === 'reply-second'),
+    'identical text from different senders never reuses the previous reply target');
+
+  for (const scenario of ['missing-uid', 'mystery', 'reply-forbidden']) {
+    await page.mouse.move(1100, 600);
+    await page.evaluate(scenario => addReplyDm(scenario, scenario === 'missing-uid' ? 0 : 12345,
+      { show_reply: scenario !== 'reply-forbidden' }, scenario === 'mystery'), scenario);
+    await awaitToolbar(scenario);
+    check(await replyButton.isDisabled(), `${scenario} cannot trigger a reply to an unknown or unsupported sender`);
+  }
+
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => { omitNativeAt = true; addReplyDm('reply-no-action'); });
+  await awaitToolbar('reply-no-action');
+  await replyButton.click();
+  await page.waitForFunction(() => nativeMenuOpens.length === 3 && !nativeReplyMenu.show);
+  check(await page.evaluate(() => replyTargets.length === 2 && document.body.textContent.includes('B站未提供该弹幕的@TA操作')),
+    'missing native @TA times out with feedback and closes only its own menu');
+
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => { omitNativeAt = false; addReplyDm('reply-cancelled'); });
+  await awaitToolbar('reply-cancelled');
+  await replyButton.click();
+  await page.evaluate(() => nativeReplyMenu.showMenu(0, 0, {
+    uid: 777, username: 'Manually selected', content: 'another message', idStr: 'manual'
+  }));
+  await page.waitForTimeout(300);
+  check(await page.evaluate(() => replyTargets.length === 2 && nativeReplyMenu.show
+    && nativeReplyMenu.danmakuMenuInfo.uid === 777), 'a newer manual menu selection cancels pending reply without clicking or closing it');
+  await page.evaluate(() => {
+    nativeReplyMenu.hideMenu();
+    document.querySelector('.danmaku-menu').remove();
+    document.getElementById('native-reply-input').remove();
+  });
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => addReplyDm('reply-missing-menu'));
+  await awaitToolbar('reply-missing-menu');
+  await replyButton.click();
+  check(await page.evaluate(() => replyTargets.length === 2
+    && document.body.textContent.includes('未找到B站回复菜单')), 'missing native menu reports failure without sending a message');
+  await page.mouse.move(1100, 600);
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => {
