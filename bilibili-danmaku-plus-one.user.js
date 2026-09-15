@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕一键 复读+1 浮窗
 // @namespace    https://greasyfork.org/
-// @version      1.5.0
+// @version      1.5.1
 // @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗
 // @author       You
 // @match        https://live.bilibili.com/*
@@ -610,7 +610,7 @@
 
   function initMenu() {
     toastEnabled = getStoredBool(TOAST_TOGGLE_KEY, true);
-    registerMenuCommandSafe('[Danmaku +1] 设置', openSettings);
+    registerMenuCommandSafe('设置菜单', openSettings);
   }
 
   function openSettings() {

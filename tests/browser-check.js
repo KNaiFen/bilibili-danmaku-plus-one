@@ -41,7 +41,7 @@ async (page) => {
         });
     }), label);
   };
-  check(await page.evaluate(() => scriptMenus.length === 1 && scriptMenus[0].label === '[Danmaku +1] 设置'),
+  check(await page.evaluate(() => scriptMenus.length === 1 && scriptMenus[0].label === '设置菜单'),
     'userscript menu contains only the settings entry');
   check(await page.locator('#danmaku-plus1-settings').count() === 0,
     'settings has no permanent page button and is created only when opened');
