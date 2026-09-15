@@ -5,6 +5,13 @@ async (page) => {
     if (!condition) throw new Error(message);
     results.push(message);
   };
+  const waitForFunction = page.waitForFunction.bind(page);
+  page.waitForFunction = async (...args) => {
+    try { return await waitForFunction(...args); }
+    catch (error) {
+      throw new Error(`${error.message}\nWaiting for: ${args[0]} (${args[1]})\nLast check: ${results.at(-1)}\nPage errors: ${errors.join('; ')}`);
+    }
+  };
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
     window.scriptMenus = [];
@@ -37,7 +44,7 @@ async (page) => {
         && [...dialog.querySelectorAll('button, input')].every(control => {
           const bounds = control.getBoundingClientRect();
           return bounds.left >= rect.left && bounds.right <= rect.right
-            && bounds.top >= rect.top && bounds.bottom <= rect.bottom;
+            && (dialog.scrollHeight > dialog.clientHeight || (bounds.top >= rect.top && bounds.bottom <= rect.bottom));
         });
     }), label);
   };
@@ -111,8 +118,15 @@ async (page) => {
     core.manager.renderTime = 0;
     core.manager.currentTime = 0;
     window.addDm = (id, mode) => {
-      // The manager's cached time can stop advancing while the engine is idle.
+      // Synchronize both clocks before injecting into an idle test player.
+      core.timeController.updateTime();
+      core.manager.renderTime = core.timeController.renderTime;
+      core.manager.currentTime = core.timeController.currentTime;
       core.add({ text: id, mode, dmid: id, size: 25, color: 16777215, stime: core.config.fn.timelineSync() * 1000 });
+      // Complete initialization together instead of injecting between the
+      // engine scheduler's separate measurement and collision stages.
+      core.manager.beforeCollisionCheck();
+      core.manager.collisionCheck();
     };
     window.dmState = id => {
       const dm = core.manager.visualArray.find(item => item.textData.dmid === id);
@@ -641,6 +655,43 @@ async (page) => {
   check(await page.evaluate(() => ![...document.body.children].some(element =>
     element.textContent === '弹幕+1成功' && element.style.opacity === '1')),
   'disabled setting suppresses success toasts immediately without stopping repeat');
+
+  await openSettings();
+  await settings.getByRole('switch', { name: '弹幕浮窗', exact: true }).uncheck();
+  await page.keyboard.press('Escape');
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => { engine.danmaku.core.clear(); addDm('仅暂停', 5); });
+  await page.waitForFunction(() => dmState('仅暂停')?.className.includes('show'));
+  const pauseOnly = await state('仅暂停');
+  await page.mouse.move(pauseOnly.x + pauseOnly.width / 2, pauseOnly.y + pauseOnly.height / 2);
+  await page.waitForFunction(() => dmState('仅暂停')?.hover);
+  check(await toolbar.isHidden(), 'disabling toolbar keeps hover pause available independently');
+  await openSettings();
+  await settings.getByRole('switch', { name: '鼠标悬停暂停' }).uncheck();
+  await page.keyboard.press('Escape');
+  await page.mouse.move(pauseOnly.x + pauseOnly.width / 2 + 1, pauseOnly.y + pauseOnly.height / 2);
+  await page.waitForTimeout(100);
+  check(!(await state('仅暂停'))?.hover && await toolbar.isHidden(),
+    'disabling both interaction switches releases existing pause and hides toolbar');
+  await openSettings();
+  await settings.getByRole('switch', { name: '弹幕浮窗', exact: true }).check();
+  await page.keyboard.press('Escape');
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => { engine.danmaku.core.clear(); addDm('仅浮窗', 5); });
+  await page.waitForFunction(() => dmState('仅浮窗')?.className.includes('show'));
+  const toolbarOnly = await state('仅浮窗');
+  await page.mouse.move(toolbarOnly.x + toolbarOnly.width / 2, toolbarOnly.y + toolbarOnly.height / 2);
+  await page.waitForFunction(() => !document.getElementById('danmaku-plus1-toolbar').hidden);
+  check(!(await state('仅浮窗')).hover, 'toolbar can appear without pausing the danmaku');
+  await toolbar.locator('[data-action="copy"]').click();
+  check(await page.evaluate(() => copied[copied.length - 1] === '仅浮窗'),
+    'toolbar actions work with hover pause disabled');
+  await page.waitForFunction(() => !dmState('仅浮窗'));
+  await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
+  check(true, 'unpaused fixed danmaku expires normally while using its toolbar');
+  await openSettings();
+  await settings.getByRole('switch', { name: '鼠标悬停暂停' }).check();
+  await page.keyboard.press('Escape');
   check(errors.length === 0, 'no uncaught JavaScript errors');
   return { passed: results.length, results };
 }

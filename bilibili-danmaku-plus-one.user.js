@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕一键 复读+1 浮窗
 // @namespace    https://greasyfork.org/
-// @version      1.5.1
-// @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗
+// @version      1.6.0
+// @description  B站直播弹幕悬停、回复、复制与一键复读，支持按弹幕数量自动复读
 // @author       You
 // @match        https://live.bilibili.com/*
 // @run-at       document-start
@@ -31,18 +31,35 @@
   const HOOKED_ATTR = 'data-plus1-hooked';
   const INJECTED_ATTR = 'data-plus1-injected';
   const TOAST_TOGGLE_KEY = 'plus1_toast_enabled';
+  const SETTING_GROUPS = [
+    { title: '自动复读', fields: [
+      { name: 'autoEnabled', key: 'plus1_auto_enabled', label: '自动复读', fallback: false },
+      { name: 'autoWindow', key: 'plus1_auto_window', label: '统计窗口（秒）', fallback: 10, min: 1, max: 3600, step: 0.1 },
+      { name: 'autoCount', key: 'plus1_auto_count', label: '触发数量（条）', fallback: 5, min: 1, max: 10000, step: 1 },
+      { name: 'autoInterval', key: 'plus1_auto_interval', label: '最小触发间隔（秒）', fallback: 5, min: 1, max: 3600, step: 0.1 }
+    ] },
+    { title: '弹幕交互', fields: [
+      { name: 'toolbarEnabled', key: 'plus1_toolbar_enabled', label: '弹幕浮窗', fallback: true },
+      { name: 'hoverEnabled', key: 'plus1_hover_enabled', label: '鼠标悬停暂停', fallback: true }
+    ] },
+    { title: '通用', fields: [
+      { name: 'successToast', key: TOAST_TOGGLE_KEY, label: '复读成功提示', fallback: true }
+    ] }
+  ];
+  const settings = {};
   const PLUS_LABEL = '+1 弹幕复读';
   const hookedItems = new WeakSet();
 
   let lastSendAt = 0;
   let ensureQueued = false;
-  let toastEnabled = true;
   let toastTimer = 0;
   let toastEl = null;
   let settingsDialog = null;
+  let resetHover = () => {};
 
   initMenu();
-  initDanmakuHover();
+  const autoRepeat = initAutoRepeat();
+  resetHover = initDanmakuHover();
 
   document.addEventListener('contextmenu', (event) => {
     // Menu is rendered async by player.
@@ -66,6 +83,7 @@
     ensureQueued = true;
     requestAnimationFrame(() => {
       ensureQueued = false;
+      autoRepeat.connect();
       ensurePlusOneMenuItem();
     });
   }
@@ -129,11 +147,111 @@
     try {
       await sendDanmakuDirect(text);
       console.info('[Danmaku +1] Sent:', text);
-      if (toastEnabled) showToast('弹幕+1成功');
+      if (settings.successToast) showToast('弹幕+1成功');
     } catch (err) {
       console.error('[Danmaku +1] Send failed:', err);
       showToast('弹幕发送失败');
     }
+  }
+
+  function initAutoRepeat() {
+    const itemSelector = '.danmaku-item[data-danmaku]';
+    let list = null;
+    let room = getRoomId();
+    let seenNodes = new WeakMap();
+    const seenIds = new Map();
+    const messages = new Map();
+    let lastTriggerAt = -Infinity;
+    let sending = false;
+    let enabledAt = Date.now();
+
+    function prune(now) {
+      const cutoff = now - settings.autoWindow * 1000;
+      for (const [text, times] of messages) {
+        while (times.length && times[0] <= cutoff) times.shift();
+        if (!times.length) messages.delete(text);
+      }
+      for (const [id, time] of seenIds) {
+        if (time > now - 3600000) break;
+        seenIds.delete(id);
+      }
+    }
+
+    function visit(item, baseline) {
+      const text = item.getAttribute('data-danmaku') || '';
+      const id = item.getAttribute('data-id_str') || '';
+      const timestamp = Number(item.getAttribute('data-timestamp'));
+      const fingerprint = JSON.stringify([id, text, item.getAttribute('data-uid'), timestamp]);
+      if (seenNodes.get(item) === fingerprint) return;
+      seenNodes.set(item, fingerprint);
+      const now = performance.now();
+      if (id) {
+        if (seenIds.has(id)) return;
+        seenIds.set(id, now);
+        // Keep deduplication bounded even in very busy rooms.
+        if (seenIds.size > 50000) seenIds.delete(seenIds.keys().next().value);
+      }
+      if (baseline || !settings.autoEnabled || !text.trim() || item.getAttribute('data-type') !== '0') return;
+      const selfUid = getCookie('DedeUserID');
+      if (selfUid && item.getAttribute('data-uid') === selfUid) return;
+      // The list can replay history on reconnect. Its timestamp may be seconds
+      // or milliseconds; count only messages received after enabling the feature.
+      const receivedAt = timestamp > 1e12 ? timestamp : timestamp * 1000;
+      const age = Date.now() - receivedAt;
+      if (receivedAt > 0 && (receivedAt < enabledAt - 1000 || age >= settings.autoWindow * 1000)) return;
+      const times = (messages.get(text) || []).filter(time => time > now - settings.autoWindow * 1000);
+      times.push(now - Math.max(0, receivedAt > 0 ? age : 0));
+      times.sort((a, b) => a - b);
+      if (times.length > settings.autoCount) times.splice(0, times.length - settings.autoCount);
+      messages.set(text, times);
+      if (times.length < settings.autoCount || sending
+        || now - lastTriggerAt < settings.autoInterval * 1000 || Date.now() - lastSendAt < 350) return;
+      lastTriggerAt = now;
+      sending = true;
+      // Reserve the cooldown before starting the request, including failures.
+      void repeatDanmaku(text).finally(() => { sending = false; });
+    }
+
+    const listObserver = new MutationObserver(records => {
+      if (getRoomId() !== room || !list?.isConnected) { connect(); return; }
+      const candidates = new Set();
+      for (const record of records) {
+        if (record.type === 'attributes') candidates.add(record.target);
+        for (const node of record.addedNodes || []) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          if (node.matches(itemSelector)) candidates.add(node);
+          node.querySelectorAll(itemSelector).forEach(item => candidates.add(item));
+        }
+      }
+      for (const item of candidates) if (list.contains(item) && item.matches(itemSelector)) visit(item, false);
+    });
+
+    function reset() {
+      messages.clear();
+      enabledAt = Date.now();
+      list?.querySelectorAll(itemSelector).forEach(item => visit(item, true));
+    }
+
+    function connect() {
+      const nextRoom = getRoomId();
+      if (nextRoom !== room) {
+        room = nextRoom;
+        seenIds.clear();
+        seenNodes = new WeakMap();
+        reset();
+      }
+      const next = document.querySelector('#chat-items');
+      if (next === list) return;
+      listObserver.disconnect();
+      list = next;
+      reset();
+      if (list) listObserver.observe(list, { childList: true, subtree: true, attributes: true,
+        attributeFilter: ['data-id_str', 'data-danmaku', 'data-uid', 'data-type', 'data-timestamp'] });
+    }
+    const timer = window.setInterval(() => { connect(); prune(performance.now()); }, 1000);
+    window.addEventListener('pagehide', () => { clearInterval(timer); listObserver.disconnect(); messages.clear(); });
+    connect();
+    return { connect, reset };
   }
 
   async function copyDanmaku(text) {
@@ -369,6 +487,11 @@
     }
 
     function positionToolbar(engine) {
+      if (!settings.toolbarEnabled) {
+        if (toolbar) toolbar.hidden = true;
+        toolbarBridge = null;
+        return;
+      }
       ensureToolbar(engine);
       const root = toolbarLayer.getBoundingClientRect();
       const area = engine.config.container.getBoundingClientRect();
@@ -454,6 +577,7 @@
       if (!held) return;
       const state = held;
       held = null;
+      if (!state.paused) return;
       const dm = state.dm;
       if (dm.shouldDestroy === state.preventExpiry) {
         if (state.ownShouldDestroy) Object.defineProperty(dm, 'shouldDestroy', state.ownShouldDestroy);
@@ -477,9 +601,12 @@
         .filter((key) => Number.isFinite(dm[key])).map((key) => [key, dm[key]]);
       const ownShouldDestroy = Object.getOwnPropertyDescriptor(dm, 'shouldDestroy');
       const preventExpiry = () => false;
-      dm.mouseEnter();
-      dm.shouldDestroy = preventExpiry;
+      if (settings.hoverEnabled) {
+        dm.mouseEnter();
+        dm.shouldDestroy = preventExpiry;
+      }
       held = { dm, manager, element, times, ownShouldDestroy, preventExpiry,
+        paused: settings.hoverEnabled, textData: dm.textData,
         startedAt: manager.renderTime, anchorX: pointer.x, leaveAt: 0,
         reply: getReplyInfo(dm.textData) };
     }
@@ -516,7 +643,7 @@
     }
 
     function checkHover() {
-      if (settingsDialog?.open) {
+      if (settingsDialog?.open || (!settings.hoverEnabled && !settings.toolbarEnabled)) {
         release();
         return;
       }
@@ -524,7 +651,8 @@
       if (held) {
         const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
         if (engine && held.manager.visualArray.includes(held.dm)
-          && held.dm.element === held.element && held.element.isConnected) {
+          && held.dm.element === held.element && held.dm.textData === held.textData
+          && held.element.isConnected && (held.paused || !held.dm.shouldDestroy())) {
           if (keepForContextMenu(engine)) {
             if (toolbar) toolbar.hidden = true;
             toolbarBridge = null;
@@ -606,10 +734,13 @@
       reset();
       clearInterval(connectTimer);
     });
+    return reset;
   }
 
   function initMenu() {
-    toastEnabled = getStoredBool(TOAST_TOGGLE_KEY, true);
+    for (const group of SETTING_GROUPS) {
+      for (const field of group.fields) settings[field.name] = getStoredSetting(field);
+    }
     registerMenuCommandSafe('设置菜单', openSettings);
   }
 
@@ -622,8 +753,19 @@
     const host = settingsDialog.getRootNode().host;
     const parent = document.fullscreenElement || document.body;
     if (host.parentElement !== parent) parent.appendChild(host);
-    settingsDialog.querySelector('[name="successToast"]').checked = toastEnabled;
+    syncSettingsControls();
     if (!settingsDialog.open) settingsDialog.showModal();
+  }
+
+  function syncSettingsControls() {
+    for (const group of SETTING_GROUPS) {
+      for (const field of group.fields) {
+        const input = settingsDialog.querySelector(`[name="${field.name}"]`);
+        if (typeof field.fallback === 'boolean') input.checked = settings[field.name];
+        else input.value = settings[field.name];
+        input.disabled = field.name.startsWith('auto') && field.name !== 'autoEnabled' && !settings.autoEnabled;
+      }
+    }
   }
 
   function createSettingsDialog() {
@@ -644,7 +786,8 @@
         box-shadow:0 12px 40px rgba(0,0,0,.25);
         font:14px/1.5 Arial,"Microsoft YaHei",sans-serif; text-shadow:none; }
       dialog::backdrop { background:rgba(0,0,0,.3); }
-      header { display:flex; align-items:center; justify-content:space-between;
+      header { position:sticky; top:0; z-index:1; background:#26272a;
+        display:flex; align-items:center; justify-content:space-between;
         gap:12px; padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.1); }
       h2 { margin:0; font-size:16px; font-weight:600; overflow-wrap:anywhere; }
       button { display:grid; place-items:center; flex:none; width:28px; height:28px;
@@ -652,11 +795,17 @@
         color:#bbb; font:24px/1 Arial,sans-serif; cursor:pointer; }
       button:hover { background:rgba(255,255,255,.1); color:#fff; }
       button:focus-visible, input:focus-visible { outline:2px solid #00aeec; outline-offset:3px; }
-      .settings-content { padding:4px 16px; }
+      .settings-content { padding:0 16px 8px; }
+      section { padding:12px 0 4px; }
+      section + section { border-top:1px solid rgba(255,255,255,.14); }
+      h3 { margin:0 0 4px; font-size:12px; font-weight:400; color:#b6b8bd; }
       .setting-row { display:flex; align-items:center; justify-content:space-between;
-        gap:20px; min-height:56px; padding:12px 0; cursor:pointer; }
-      .setting-row + .setting-row { border-top:1px solid rgba(255,255,255,.08); }
+        gap:16px; min-height:42px; padding:6px 0; cursor:pointer; }
       .setting-row span { min-width:0; overflow-wrap:anywhere; }
+      input[type="number"] { width:84px; flex:none; height:30px; padding:3px 6px;
+        border:1px solid rgba(255,255,255,.2); border-radius:4px; background:#303236;
+        color:inherit; font:inherit; }
+      input:disabled { opacity:.4; cursor:default; }
       input[type="checkbox"] { appearance:none; position:relative; flex:none;
         width:34px; height:20px; margin:0; border:1px solid rgba(255,255,255,.2);
         border-radius:10px; background:#54565b; cursor:pointer; }
@@ -681,20 +830,45 @@
 
     const content = document.createElement('div');
     content.className = 'settings-content';
-    const row = document.createElement('label');
-    row.className = 'setting-row';
-    const label = document.createElement('span');
-    label.textContent = '复读成功提示';
-    const toggle = document.createElement('input');
-    toggle.type = 'checkbox';
-    toggle.name = 'successToast';
-    toggle.setAttribute('role', 'switch');
-    toggle.addEventListener('change', () => {
-      toastEnabled = toggle.checked;
-      setStoredBool(TOAST_TOGGLE_KEY, toastEnabled);
-    });
-    row.append(label, toggle);
-    content.appendChild(row);
+    for (const [index, group] of SETTING_GROUPS.entries()) {
+      const section = document.createElement('section');
+      const heading = document.createElement('h3');
+      heading.id = `settings-group-${index}`;
+      heading.textContent = group.title;
+      section.setAttribute('aria-labelledby', heading.id);
+      section.appendChild(heading);
+      for (const field of group.fields) {
+        const row = document.createElement('label');
+        row.className = 'setting-row';
+        const label = document.createElement('span');
+        label.textContent = field.label;
+        const input = document.createElement('input');
+        input.name = field.name;
+        const isBool = typeof field.fallback === 'boolean';
+        input.type = isBool ? 'checkbox' : 'number';
+        if (isBool) input.setAttribute('role', 'switch');
+        else {
+          input.min = field.min;
+          input.max = field.max;
+          input.step = field.step;
+          input.required = true;
+        }
+        input.addEventListener('change', () => {
+          if (!input.checkValidity()) { input.reportValidity(); return; }
+          settings[field.name] = isBool ? input.checked : input.valueAsNumber;
+          setStoredSetting(field.key, settings[field.name]);
+          if (field.name.startsWith('auto')) autoRepeat.reset();
+          if (field.name === 'toolbarEnabled' || field.name === 'hoverEnabled') resetHover();
+          syncSettingsControls();
+        });
+        input.addEventListener('blur', () => {
+          if (!input.checkValidity()) input.value = settings[field.name];
+        });
+        row.append(label, input);
+        section.appendChild(row);
+      }
+      content.appendChild(section);
+    }
     settingsDialog.append(header, content);
     root.append(style, settingsDialog);
 
@@ -756,30 +930,31 @@
     } catch (_) {}
   }
 
-  function getStoredBool(key, fallback) {
+  function getStoredSetting(field) {
+    let value = field.fallback;
     try {
       if (typeof GM_getValue === 'function') {
-        return Boolean(GM_getValue(key, fallback));
+        value = GM_getValue(field.key, field.fallback);
+      } else {
+        const raw = localStorage.getItem(`danmaku_plus1_${field.key}`);
+        if (raw !== null) value = typeof field.fallback === 'boolean' ? raw === '1' : Number(raw);
       }
     } catch (_) {}
-    try {
-      const raw = localStorage.getItem(`danmaku_plus1_${key}`);
-      if (raw == null) return fallback;
-      return raw === '1';
-    } catch (_) {
-      return fallback;
-    }
+    if (typeof field.fallback === 'boolean') return typeof value === 'boolean' ? value : field.fallback;
+    return typeof value === 'number' && Number.isFinite(value) && value >= field.min && value <= field.max
+      && Math.abs((value - field.min) / field.step - Math.round((value - field.min) / field.step)) < 1e-7
+      ? value : field.fallback;
   }
 
-  function setStoredBool(key, value) {
+  function setStoredSetting(key, value) {
     try {
       if (typeof GM_setValue === 'function') {
-        GM_setValue(key, Boolean(value));
+        GM_setValue(key, value);
         return;
       }
     } catch (_) {}
     try {
-      localStorage.setItem(`danmaku_plus1_${key}`, value ? '1' : '0');
+      localStorage.setItem(`danmaku_plus1_${key}`, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
     } catch (_) {}
   }
 

@@ -19,3 +19,4 @@ pwcli() {
 pwcli -s=danmaku-qa open about:blank
 trap 'pwcli -s=danmaku-qa close' EXIT
 pwcli -s=danmaku-qa run-code --filename tests/browser-check.js
+pwcli -s=danmaku-qa run-code --filename tests/auto-repeat-check.js
