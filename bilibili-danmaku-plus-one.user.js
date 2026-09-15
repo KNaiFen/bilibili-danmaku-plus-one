@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.1.6
-// @description  给右键菜单添加一个+1选项，当选中弹幕右键的时候点击这个+1就能复读弹幕
+// @version      1.2.0
+// @description  悬停暂停单条直播弹幕，移开后继续；右键菜单点击+1复读选中弹幕
 // @author       You
 // @match        https://live.bilibili.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/568461/Bilibili%E7%9B%B4%E6%92%AD%E5%BC%B9%E5%B9%95%2B1%E5%A4%8D%E8%AF%BB%E6%8C%89%E9%92%AE.user.js
 // @updateURL https://update.greasyfork.org/scripts/568461/Bilibili%E7%9B%B4%E6%92%AD%E5%BC%B9%E5%B9%95%2B1%E5%A4%8D%E8%AF%BB%E6%8C%89%E9%92%AE.meta.js
@@ -29,8 +30,9 @@
   const HOOKED_ATTR = 'data-plus1-hooked';
   const INJECTED_ATTR = 'data-plus1-injected';
   const TOAST_TOGGLE_KEY = 'plus1_toast_enabled';
+  const PLUS_LABEL = '+1 弹幕复读';
+  const hookedItems = new WeakSet();
 
-  let lastDanmakuText = '';
   let lastSendAt = 0;
   let ensureQueued = false;
   let toastEnabled = true;
@@ -38,14 +40,9 @@
   let toastEl = null;
 
   initMenu();
+  initDanmakuHover();
 
   document.addEventListener('contextmenu', (event) => {
-    const dm = event.target && event.target.closest
-      ? event.target.closest('.bili-danmaku-x-dm')
-      : null;
-    if (!dm) return;
-    const text = (dm.textContent || '').trim();
-    if (text) lastDanmakuText = text;
     // Menu is rendered async by player.
     setTimeout(scheduleEnsure, 0);
     setTimeout(scheduleEnsure, 30);
@@ -55,10 +52,12 @@
   const observer = new MutationObserver(() => {
     scheduleEnsure();
   });
-  observer.observe(document.documentElement || document.body, {
-    childList: true,
-    subtree: true
-  });
+  function observePage() {
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    scheduleEnsure();
+  }
+  if (document.documentElement) observePage();
+  else document.addEventListener('DOMContentLoaded', observePage, { once: true });
 
   function scheduleEnsure() {
     if (ensureQueued) return;
@@ -70,134 +69,60 @@
   }
 
   function ensurePlusOneMenuItem() {
-    const handledMenus = new Set();
-
-    const copyItems = findVisibleTextNodes('复制弹幕');
-    for (const copyTextNode of copyItems) {
-      const copyItem = findMenuItemElement(copyTextNode);
-      if (!copyItem) continue;
-
-      const submenu = copyItem.parentElement;
-      if (!submenu) continue;
-      if (!submenu.textContent.includes('举报选中弹幕')) continue;
-
-      // Put +1 in first-level menu: after submenu host item.
-      const hostItem = submenu.closest('li');
-      const mainMenu = hostItem && hostItem.parentElement && hostItem.parentElement.tagName === 'UL'
-        ? hostItem.parentElement
-        : submenu;
-      if (!mainMenu || !isLikelyMenu(mainMenu)) continue;
-      const anchorItem = hostItem || copyItem;
-      const dmText = getDanmakuTextFromMenuContext(copyItem);
-      const statsTemplate = findMenuItemByText(mainMenu, '视频统计信息');
-      const templateItem = statsTemplate || copyItem;
-
-      let existingPlusItem = findMenuItemByText(mainMenu, '+1 弹幕复读');
-      if (existingPlusItem && existingPlusItem.parentElement !== mainMenu) {
-        // Stale +1 in nested submenu: recreate with first-level style.
-        existingPlusItem = null;
+    // Player marks selected-danmaku entries with data-auto-remove, even before
+    // their submenu is hovered. Never infer a selection from a normal menu item.
+    const menus = new Set();
+    document.querySelectorAll('li[data-auto-remove="1"], li[' + INJECTED_ATTR + ']').forEach((item) => {
+      if (item.parentElement?.tagName === 'UL') menus.add(item.parentElement);
+    });
+    for (const menu of menus) {
+      const anchor = findDanmakuAnchorInMainMenu(menu);
+      const text = extractItemMainLabel(anchor);
+      const existing = Array.from(menu.children).filter((item) => item.hasAttribute(INJECTED_ATTR));
+      if (!anchor || !text) {
+        existing.forEach((item) => item.remove());
+        continue;
       }
-      if (existingPlusItem) {
-        // Ensure +1 uses non-submenu item style.
-        if ((existingPlusItem.className || '') !== (templateItem.className || '')) {
-          const replacement = templateItem.cloneNode(true);
-          replacement.setAttribute(INJECTED_ATTR, '1');
-          replacement.removeAttribute(HOOKED_ATTR);
-          replacement.querySelectorAll('ul').forEach((ul) => ul.remove());
-          setPrimaryLabelText(replacement, '+1 弹幕复读');
-          if (existingPlusItem.parentElement) {
-            existingPlusItem.parentElement.replaceChild(replacement, existingPlusItem);
-          }
-          existingPlusItem = replacement;
-        }
-        if (dmText) existingPlusItem.setAttribute('data-plus1-text', dmText);
-        if (anchorItem && anchorItem.parentElement === mainMenu && existingPlusItem !== anchorItem.nextSibling) {
-          mainMenu.insertBefore(existingPlusItem, anchorItem.nextSibling);
-        }
-        hookPlusItem(existingPlusItem);
-      } else {
-        // Clone "视频统计信息" style when possible.
-        const plusItem = templateItem.cloneNode(true);
-        plusItem.setAttribute(INJECTED_ATTR, '1');
-        plusItem.removeAttribute(HOOKED_ATTR);
-        plusItem.querySelectorAll('ul').forEach((ul) => ul.remove());
-        setPrimaryLabelText(plusItem, '+1 弹幕复读');
-        if (dmText) plusItem.setAttribute('data-plus1-text', dmText);
-        hookPlusItem(plusItem);
-        if (anchorItem && anchorItem.parentElement === mainMenu) {
-          mainMenu.insertBefore(plusItem, anchorItem.nextSibling);
-        } else {
-          mainMenu.appendChild(plusItem);
-        }
-      }
-
-      // Remove stale +1 from second-level submenu.
-      const plusInSubmenu = findMenuItemByText(submenu, '+1 弹幕复读');
-      if (plusInSubmenu && plusInSubmenu.parentElement === submenu) {
-        plusInSubmenu.remove();
-      }
-
-      handledMenus.add(mainMenu);
-    }
-
-    // First-open fallback:
-    // inject +1 from first-level menu even when secondary submenu hasn't been hovered yet.
-    const statItems = findVisibleTextNodes('视频统计信息');
-    for (const statTextNode of statItems) {
-      const statItem = findMenuItemElement(statTextNode);
-      if (!statItem) continue;
-      const mainMenu = statItem.parentElement;
-      if (!mainMenu || !isLikelyMenu(mainMenu)) continue;
-      if (handledMenus.has(mainMenu)) continue;
-
-      const anchorItem = findDanmakuAnchorInMainMenu(mainMenu) || statItem;
-      const dmText = extractItemMainLabel(anchorItem) || (lastDanmakuText || '').trim();
-
-      let plusItem = findMenuItemByText(mainMenu, '+1 弹幕复读');
+      const template = Array.from(menu.children).find((item) =>
+        item.tagName === 'LI' && !item.hasAttribute(INJECTED_ATTR)
+        && extractItemMainLabel(item) === '视频统计信息');
+      if (!template) continue;
+      let plusItem = existing.shift();
+      existing.forEach((item) => item.remove());
       if (!plusItem) {
-        plusItem = statItem.cloneNode(true);
+        plusItem = template.cloneNode(true);
         plusItem.setAttribute(INJECTED_ATTR, '1');
         plusItem.removeAttribute(HOOKED_ATTR);
+        plusItem.removeAttribute('id');
+        plusItem.removeAttribute('onclick');
         plusItem.querySelectorAll('ul').forEach((ul) => ul.remove());
-        setPrimaryLabelText(plusItem, '+1 弹幕复读');
-        mainMenu.insertBefore(plusItem, anchorItem.nextSibling);
-      } else if (plusItem.parentElement === mainMenu && plusItem !== anchorItem.nextSibling) {
-        mainMenu.insertBefore(plusItem, anchorItem.nextSibling);
+        setPrimaryLabelText(plusItem, PLUS_LABEL);
       }
-
-      if (dmText) plusItem.setAttribute('data-plus1-text', dmText);
-      hookPlusItem(plusItem);
-      handledMenus.add(mainMenu);
-    }
-
-    // If page JS already injects +1, take over its click behavior.
-    const plusTextNodes = findVisibleTextNodes('+1 弹幕复读');
-    for (const plusTextNode of plusTextNodes) {
-      const plusItem = findMenuItemElement(plusTextNode);
-      if (!plusItem) continue;
-      const menuContainer = plusItem.parentElement;
-      if (!menuContainer) continue;
-      if (!menuContainer.textContent.includes('举报选中弹幕')) continue;
+      plusItem.className = template.className;
+      plusItem.setAttribute('data-plus1-text', text);
+      if (anchor.nextElementSibling !== plusItem) menu.insertBefore(plusItem, anchor.nextSibling);
       hookPlusItem(plusItem);
     }
   }
 
   function hookPlusItem(itemEl) {
-    if (!itemEl || itemEl.getAttribute(HOOKED_ATTR) === '1') return;
+    if (!itemEl || hookedItems.has(itemEl)) return;
+    hookedItems.add(itemEl);
     itemEl.setAttribute(HOOKED_ATTR, '1');
 
     itemEl.addEventListener('click', async (event) => {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      closeContextMenu(itemEl);
+      // Closing the native menu removes the selected entry synchronously.
+      const text = resolveDanmakuText(itemEl);
+      closeContextMenu();
 
       // Simple anti-double-click.
       const now = Date.now();
       if (now - lastSendAt < 350) return;
       lastSendAt = now;
 
-      const text = resolveDanmakuText(itemEl);
       if (!text) {
         console.warn('[Danmaku +1] Cannot resolve danmaku text from context menu.');
         return;
@@ -215,7 +140,7 @@
     }, true);
   }
 
-  function closeContextMenu(itemEl) {
+  function closeContextMenu() {
     // Do not mutate menu DOM directly; let page logic close it to avoid stuck state.
     const clickTarget = document.body || document.documentElement;
     clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
@@ -223,15 +148,8 @@
   }
 
   function resolveDanmakuText(itemEl) {
-    const boundText = normalizeText(itemEl && itemEl.getAttribute
-      ? (itemEl.getAttribute('data-plus1-text') || '')
-      : '');
-    if (boundText) return boundText;
-    // Preferred path: read text from the same context-menu root container.
-    const fromMenu = getDanmakuTextFromMenuContext(itemEl);
-    if (fromMenu) return fromMenu;
-    // Fallback: text captured at right-click time.
-    return (lastDanmakuText || '').trim();
+    const menu = itemEl?.parentElement;
+    return menu ? extractItemMainLabel(findDanmakuAnchorInMainMenu(menu)) : '';
   }
 
   function setPrimaryLabelText(itemEl, text) {
@@ -251,10 +169,9 @@
   }
 
   function findDanmakuAnchorInMainMenu(mainMenu) {
-    const byAutoRemove = mainMenu.querySelector('li[data-auto-remove=\"1\"]');
-    if (byAutoRemove) return byAutoRemove;
-    const firstLi = Array.from(mainMenu.children || []).find((n) => n && n.tagName === 'LI');
-    return firstLi || null;
+    return Array.from(mainMenu.children).find((item) =>
+      item.tagName === 'LI' && item.getAttribute('data-auto-remove') === '1'
+      && !item.hasAttribute(INJECTED_ATTR)) || null;
   }
 
   function extractItemMainLabel(itemEl) {
@@ -264,70 +181,156 @@
     return normalizeText(clone.textContent || '');
   }
 
-  function isLikelyMenu(el) {
-    if (!el || el.tagName !== 'UL') return false;
-    return Array.from(el.children || []).some((c) => c && c.tagName === 'LI');
-  }
-
-  function getDanmakuTextFromMenuContext(itemEl) {
-    const menu = itemEl && itemEl.closest ? itemEl.closest('ul') : null;
-    if (!menu) return '';
-    const root = menu.parentElement;
-    if (!root) return getTextFromAncestorChain(menu, menu);
-
-    // In current player DOM, root children are usually:
-    // 1) danmaku text element, 2) decoration div, 3) menu ul.
-    const directText = getFirstDirectChildTextExcluding(root, menu);
-    if (directText) return directText;
-
-    // Fallback: gather descendant text excluding the menu subtree.
-    const deepText = getDescendantTextExcluding(root, menu);
-    if (deepText) return deepText;
-
-    // Final fallback: climb a few levels in case menu is wrapped by extra nodes.
-    return getTextFromAncestorChain(root, menu);
-  }
-
-  function getFirstDirectChildTextExcluding(root, excludedChild) {
-    const children = Array.from(root.children || []);
-    for (const child of children) {
-      if (child === excludedChild) continue;
-      const text = normalizeText(child.textContent || '');
-      if (text) return text;
-    }
-    return '';
-  }
-
-  function getDescendantTextExcluding(root, excludedSubtree) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const parts = [];
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const parent = node && node.parentElement;
-      if (!parent) continue;
-      if (excludedSubtree.contains(parent)) continue;
-      const text = normalizeText(node.nodeValue || '');
-      if (!text) continue;
-      parts.push(text);
-    }
-    if (!parts.length) return '';
-    // Prefer the longest chunk, usually the danmaku content.
-    parts.sort((a, b) => b.length - a.length);
-    return parts[0];
-  }
-
   function normalizeText(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
-  function getTextFromAncestorChain(startEl, excludedSubtree) {
-    let cur = startEl;
-    for (let depth = 0; cur && depth < 5; depth += 1) {
-      const text = getDescendantTextExcluding(cur, excludedSubtree);
-      if (text) return text;
-      cur = cur.parentElement;
+  function initDanmakuHover() {
+    const pageWindow = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    const engines = new Set();
+    const patched = new WeakSet();
+    let pointer = null;
+    let held = null;
+    let frame = 0;
+    let lastCheck = 0;
+
+    // LiveDanmakuEngine is loaded asynchronously. Hook before the player calls
+    // onSelect so we can reach the existing engine without creating another one.
+    function connectEngine() {
+      const prototype = pageWindow.LiveDanmakuEngine?.default?.prototype;
+      if (!prototype || patched.has(prototype) || typeof prototype.onSelect !== 'function') return;
+      patched.add(prototype);
+      for (const name of ['onSelect', 'set', 'resize']) {
+        const original = prototype[name];
+        if (typeof original !== 'function') continue;
+        prototype[name] = function (...args) {
+          if (this.config?.container && this.danmaku) engines.add(this);
+          return Reflect.apply(original, this, args);
+        };
+      }
     }
-    return '';
+    connectEngine();
+    document.addEventListener('load', connectEngine, true);
+    const connectTimer = window.setInterval(connectEngine, 1000);
+
+    function managerOf(engine) {
+      return engine.danmaku?.core?.manager || engine.danmaku?.magic?.core?.manager;
+    }
+
+    function containsPoint(element) {
+      if (!element?.isConnected || !pointer) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0
+        && pointer.x >= rect.left && pointer.x < rect.right
+        && pointer.y >= rect.top && pointer.y < rect.bottom;
+    }
+
+    function isOverPlayer(engine) {
+      const container = engine.config.container;
+      if (!containsPoint(container)) return false;
+      const target = document.elementFromPoint(pointer.x, pointer.y);
+      const player = engine.layerWrap?.parentElement || container.parentElement;
+      // Danmaku layers use pointer-events:none; hit-test the player underneath.
+      return !!target && !!player?.contains(target)
+        && !target.closest('ul, button, input, textarea, [role="dialog"]');
+    }
+
+    function release() {
+      if (!held) return;
+      const state = held;
+      held = null;
+      const dm = state.dm;
+      if (dm.shouldDestroy === state.preventExpiry) {
+        if (state.ownShouldDestroy) Object.defineProperty(dm, 'shouldDestroy', state.ownShouldDestroy);
+        else delete dm.shouldDestroy;
+      }
+      // A cleared/recycled node must not be modified on behalf of its old owner.
+      if (!state.manager.visualArray.includes(dm) || dm.element !== state.element) return;
+      const elapsed = Math.max(0, state.manager.renderTime - state.startedAt);
+      dm.mouseLeave();
+      // Native mouseLeave counts wall time. Use engine time so buffering or a
+      // paused video does not grant an extra lifetime after leaving the text.
+      for (const [key, value] of state.times) dm[key] = value + elapsed;
+    }
+
+    function hold(dm, manager) {
+      if (dm.isHover || !Number.isFinite(manager.renderTime)) return;
+      const element = dm.element;
+      // Reading x updates the engine's hit-test position before isHover freezes it.
+      void dm.x;
+      const times = ['middle', 'endTime', '_reverseMiddle']
+        .filter((key) => Number.isFinite(dm[key])).map((key) => [key, dm[key]]);
+      const ownShouldDestroy = Object.getOwnPropertyDescriptor(dm, 'shouldDestroy');
+      const preventExpiry = () => false;
+      dm.mouseEnter();
+      dm.shouldDestroy = preventExpiry;
+      held = { dm, manager, element, times, ownShouldDestroy, preventExpiry, startedAt: manager.renderTime };
+    }
+
+    function checkHover() {
+      if (held) {
+        const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
+        if (engine && held.manager.visualArray.includes(held.dm)
+          && held.dm.element === held.element && containsPoint(held.element)
+          && isOverPlayer(engine)) return;
+        release();
+      }
+      for (const engine of engines) {
+        if (!engine.config.container.isConnected || engine.danmaku.destroyed) {
+          engines.delete(engine);
+          continue;
+        }
+        if (!isOverPlayer(engine)) continue;
+        const manager = managerOf(engine);
+        if (!manager?.visualArray) continue;
+        for (let i = manager.visualArray.length - 1; i >= 0; i -= 1) {
+          const dm = manager.visualArray[i];
+          const mode = dm.textData?.rawMode || dm.textData?.mode;
+          if (![1, 4, 5, 6].includes(mode) || !dm.showed || dm.isHide
+            || typeof dm.mouseEnter !== 'function' || typeof dm.mouseLeave !== 'function'
+            || typeof dm.shouldDestroy !== 'function' || dm.shouldDestroy()
+            || !dm.element?.matches('.bili-danmaku-x-dm.bili-danmaku-x-show')
+            || !containsPoint(dm.element)) continue;
+          const style = getComputedStyle(dm.element);
+          if (style.visibility !== 'visible' || Number(style.opacity) === 0) continue;
+          hold(dm, manager);
+          return;
+        }
+      }
+    }
+
+    function tick(now) {
+      frame = 0;
+      if (!pointer) return;
+      // Also catch moving text passing underneath a stationary mouse.
+      if (now - lastCheck >= 32) {
+        lastCheck = now;
+        checkHover();
+      }
+      frame = requestAnimationFrame(tick);
+    }
+
+    function reset() {
+      pointer = null;
+      cancelAnimationFrame(frame);
+      frame = 0;
+      release();
+    }
+    document.addEventListener('pointermove', (event) => {
+      if (event.pointerType === 'touch') return;
+      pointer = { x: event.clientX, y: event.clientY };
+      if (!frame) frame = requestAnimationFrame(tick);
+    }, { capture: true, passive: true });
+    document.addEventListener('pointerout', (event) => {
+      if (!event.relatedTarget) reset();
+    }, true);
+    document.addEventListener('contextmenu', release, true);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) reset(); });
+    window.addEventListener('blur', reset);
+    window.addEventListener('pagehide', () => {
+      reset();
+      clearInterval(connectTimer);
+    });
   }
 
   function initMenu() {
@@ -556,50 +559,6 @@
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const m = document.cookie.match(new RegExp(`(?:^|; )${escaped}=([^;]*)`));
     return m ? decodeURIComponent(m[1]) : '';
-  }
-
-  function findVisibleTextNodes(text) {
-    const all = Array.from(document.querySelectorAll('div,li,span,p'));
-    return all.filter((el) => {
-      if (!isVisible(el)) return false;
-      return (el.textContent || '').trim() === text;
-    });
-  }
-
-  function findMenuItemByText(menuContainer, text) {
-    const all = Array.from(menuContainer.querySelectorAll('div,li,span,p'));
-    for (const el of all) {
-      if ((el.textContent || '').trim() !== text) continue;
-      const item = findMenuItemElement(el);
-      if (item) return item;
-    }
-    return null;
-  }
-
-  function findMenuItemElement(el) {
-    if (!el) return null;
-    const byRole = el.closest('[role="menuitem"]');
-    if (byRole) return byRole;
-    const byLi = el.closest('li');
-    if (byLi) return byLi;
-    return el.closest('div');
-  }
-
-  function isVisible(el) {
-    if (!el || !(el instanceof Element)) return false;
-    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  }
-
-  function replaceFirstText(root, fromText, toText) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      if (!node || !node.nodeValue) continue;
-      if (node.nodeValue.trim() === fromText) {
-        node.nodeValue = node.nodeValue.replace(fromText, toText);
-        return;
-      }
-    }
   }
 
   // MD5 (small JS implementation).

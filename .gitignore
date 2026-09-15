@@ -1,4 +1,7 @@
 node_modules/
+.example/
+.playwright-cli/
+output/
 generated/
 cache/
 out/
