@@ -226,6 +226,138 @@ async (page) => {
   await page.waitForFunction(() => !!document.querySelector('[data-plus1-injected]'));
   await page.evaluate(() => document.querySelector('[data-plus1-injected]').click());
   check(await page.evaluate(() => sent[1] === '+1 弹幕复读'), 'a real danmaku matching the button label remains valid');
+
+  await page.mouse.move(1100, 600);
+  await page.evaluate(() => {
+    document.getElementById('context-menu').remove();
+    engine.danmaku.core.clear();
+    window.copied = [];
+    window.GM_setClipboard = text => copied.push(text);
+    window.sent = [];
+    window.playerClicks = 0;
+    document.getElementById('player').addEventListener('click', () => playerClicks++);
+    addDm('浮窗复制和复读 [表情]', 5);
+  });
+  const toolbar = page.locator('#danmaku-plus1-toolbar');
+  const awaitToolbar = async id => {
+    await page.waitForFunction(id => dmState(id)?.className.includes('show'), id);
+    const dm = await state(id);
+    const viewport = page.viewportSize();
+    const x = Math.max(8, Math.min(dm.x + dm.width / 2, Math.min(960, viewport.width) - 8));
+    await page.mouse.move(x, dm.y + dm.height / 2);
+    await page.waitForFunction(id => dmState(id)?.hover && !document.getElementById('danmaku-plus1-toolbar').hidden, id);
+    return dm;
+  };
+  const assertBounds = async label => {
+    const bounds = await page.evaluate(() => {
+      const bar = document.getElementById('danmaku-plus1-toolbar');
+      const panel = bar.getBoundingClientRect();
+      const area = engine.config.container.getBoundingClientRect();
+      const buttons = [...bar.querySelectorAll('button')].map(button => {
+        const rect = button.getBoundingClientRect();
+        return { inside: rect.left >= panel.left && rect.right <= panel.right && rect.top >= panel.top && rect.bottom <= panel.bottom,
+          fits: button.scrollWidth <= button.clientWidth, hit: document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) === button };
+      });
+      return { inside: panel.left >= Math.max(0, area.left) && panel.right <= Math.min(innerWidth, area.right)
+        && panel.top >= Math.max(0, area.top) && panel.bottom <= Math.min(innerHeight, area.bottom), buttons };
+    });
+    check(bounds.inside && bounds.buttons.every(button => button.inside && button.fits && button.hit), label);
+  };
+  const toolbarDm = await awaitToolbar('浮窗复制和复读 [表情]');
+  check(await toolbar.getAttribute('data-placement') === 'bottom', 'toolbar appears below top danmaku');
+  check(await toolbar.locator('[data-action="reply"]').isDisabled(), 'reply is a disabled placeholder');
+  await assertBounds('toolbar and all three buttons are visible and clickable inside the player');
+  const barRect = await toolbar.boundingBox();
+  await page.mouse.move(barRect.x + barRect.width / 2, (toolbarDm.y + toolbarDm.height + barRect.y) / 2);
+  await page.waitForTimeout(250);
+  check(!!(await state('浮窗复制和复读 [表情]'))?.hover, 'crossing the gap from danmaku to toolbar keeps it paused');
+  await toolbar.locator('[data-action="copy"]').click();
+  check(await page.evaluate(() => copied[0] === '浮窗复制和复读 [表情]'), 'copy uses original danmaku text from engine data');
+  check(await toolbar.locator('[data-action="copy"]').textContent() === '已复制', 'copy displays success without resizing the toolbar');
+  await toolbar.locator('[data-action="repeat"]').click();
+  await page.waitForFunction(() => sent.length === 1);
+  check(await page.evaluate(() => sent[0] === '浮窗复制和复读 [表情]' && playerClicks === 0), 'toolbar repeat sends correct text without clicking the player');
+  await page.waitForTimeout(3300);
+  check(!!(await state('浮窗复制和复读 [表情]'))?.hover, 'toolbar hover protects fixed danmaku past its expiration');
+  await page.screenshot({ path: 'output/playwright/toolbar-top.png' });
+  await page.mouse.move(400, 300);
+  await page.waitForFunction(() => !dmState('浮窗复制和复读 [表情]')?.hover && document.getElementById('danmaku-plus1-toolbar').hidden);
+  check(true, 'leaving both toolbar and text closes the toolbar and resumes danmaku');
+
+  await page.evaluate(() => {
+    engine.danmaku.core.clear();
+    addDm('底部弹幕', 4);
+  });
+  await awaitToolbar('底部弹幕');
+  check(await toolbar.getAttribute('data-placement') === 'top', 'bottom danmaku flips toolbar above the text');
+  check(await toolbar.locator('[data-action="copy"]').textContent() === '复制', 'copy feedback resets for a different danmaku');
+  await assertBounds('bottom toolbar stays completely inside player bounds');
+  await toolbar.locator('[data-action="copy"]').hover();
+  await page.screenshot({ path: 'output/playwright/toolbar-bottom.png' });
+  await page.mouse.move(1100, 600);
+  await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
+
+  for (const edge of ['left', 'right']) {
+    await page.evaluate(edge => {
+      engine.danmaku.core.clear();
+      addDm('边缘弹幕 ' + edge, 5);
+    }, edge);
+    await page.waitForFunction(id => dmState(id)?.className.includes('show'), '边缘弹幕 ' + edge);
+    await page.evaluate(edge => {
+      const dm = engine.danmaku.core.manager.visualArray.find(item => item.textData.dmid === '边缘弹幕 ' + edge);
+      dm.element.style.setProperty('left', edge === 'left' ? '-20px' : '900px', 'important');
+      dm.element.style.setProperty('transform', 'none', 'important');
+    }, edge);
+    await awaitToolbar('边缘弹幕 ' + edge);
+    await assertBounds(`${edge} edge toolbar is clamped and all buttons remain reachable`);
+    await toolbar.locator('[data-action="copy"]').hover();
+    await page.screenshot({ path: `output/playwright/toolbar-${edge}.png` });
+    await page.mouse.move(1100, 600);
+    await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => {
+    engine.danmaku.core.clear();
+    document.getElementById('player').style.width = '390px';
+    document.getElementById('player').style.height = '220px';
+    engine.resize();
+  });
+  await page.waitForTimeout(100);
+  await page.evaluate(() => addDm('窄窗口底部弹幕', 4));
+  await awaitToolbar('窄窗口底部弹幕');
+  await assertBounds('narrow 390px player keeps every toolbar button inside its bounds');
+  await toolbar.locator('[data-action="copy"]').hover();
+  await page.screenshot({ path: 'output/playwright/toolbar-mobile.png' });
+  await page.mouse.move(300, 600);
+  await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.evaluate(() => {
+    engine.danmaku.core.clear();
+    document.getElementById('player').style.cssText = 'position:relative;width:960px;height:540px;background:#333;transform:scale(.75);transform-origin:top left;margin:30px';
+    engine.resize();
+  });
+  await page.waitForTimeout(100);
+  await page.evaluate(() => addDm('缩放播放器弹幕', 4));
+  await awaitToolbar('缩放播放器弹幕');
+  await assertBounds('scaled and offset player keeps toolbar aligned to its own coordinates');
+  await page.mouse.move(1100, 600);
+  await page.waitForFunction(() => document.getElementById('danmaku-plus1-toolbar').hidden);
+  await page.evaluate(async () => {
+    engine.danmaku.core.clear();
+    const player = document.getElementById('player');
+    player.style.transform = 'none';
+    player.style.margin = '0';
+    await player.requestFullscreen();
+    engine.resize();
+  });
+  await page.waitForTimeout(150);
+  await page.evaluate(() => addDm('全屏弹幕', 5));
+  await awaitToolbar('全屏弹幕');
+  check(await page.evaluate(() => document.fullscreenElement.contains(document.getElementById('danmaku-plus1-toolbar'))), 'toolbar remains in the fullscreen player DOM');
+  await assertBounds('fullscreen toolbar is visible and clickable');
+  await page.screenshot({ path: 'output/playwright/toolbar-fullscreen.png' });
+  await page.evaluate(() => document.exitFullscreen());
   check(errors.length === 0, 'no uncaught JavaScript errors');
   return { passed: results.length, results };
 }

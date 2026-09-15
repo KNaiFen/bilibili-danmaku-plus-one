@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.2.1
-// @description  悬停暂停单条直播弹幕，移开后继续；右键菜单点击+1复读选中弹幕
+// @version      1.3.0
+// @description  悬停暂停单条直播弹幕并显示复制、复读浮窗；支持右键菜单+1复读
 // @author       You
 // @match        https://live.bilibili.com/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/568461/Bilibili%E7%9B%B4%E6%92%AD%E5%BC%B9%E5%B9%95%2B1%E5%A4%8D%E8%AF%BB%E6%8C%89%E9%92%AE.user.js
@@ -117,27 +118,31 @@
       // Closing the native menu removes the selected entry synchronously.
       const text = resolveDanmakuText(itemEl);
       closeContextMenu();
-
-      // Simple anti-double-click.
-      const now = Date.now();
-      if (now - lastSendAt < 350) return;
-      lastSendAt = now;
-
-      if (!text) {
-        console.warn('[Danmaku +1] Cannot resolve danmaku text from context menu.');
-        return;
-      }
-
-      try {
-        await sendDanmakuDirect(text);
-        console.info('[Danmaku +1] Sent:', text);
-        if (toastEnabled) {
-          showToast('弹幕+1成功');
-        }
-      } catch (err) {
-        console.error('[Danmaku +1] Send failed:', err);
-      }
+      await repeatDanmaku(text);
     }, true);
+  }
+
+  async function repeatDanmaku(text) {
+    if (!text) return;
+    const now = Date.now();
+    if (now - lastSendAt < 350) return;
+    lastSendAt = now;
+    try {
+      await sendDanmakuDirect(text);
+      console.info('[Danmaku +1] Sent:', text);
+      if (toastEnabled) showToast('弹幕+1成功');
+    } catch (err) {
+      console.error('[Danmaku +1] Send failed:', err);
+      showToast('弹幕发送失败');
+    }
+  }
+
+  async function copyDanmaku(text) {
+    if (typeof GM_setClipboard === 'function') {
+      GM_setClipboard(text, 'text');
+    } else {
+      await navigator.clipboard.writeText(text);
+    }
   }
 
   function closeContextMenu() {
@@ -194,6 +199,125 @@
     let contextMenu = null;
     let frame = 0;
     let lastCheck = 0;
+    let toolbar = null;
+    let toolbarLayer = null;
+    let toolbarBridge = null;
+    let toolbarOwner = null;
+    let toolbarStyle = null;
+
+    function ensureToolbar(engine) {
+      if (!toolbar) {
+        toolbarStyle = document.createElement('style');
+        toolbarStyle.textContent = `
+          #danmaku-plus1-layer { position:absolute; inset:0; pointer-events:none; z-index:2147483646; }
+          #danmaku-plus1-toolbar { position:absolute; box-sizing:border-box; display:grid;
+            grid-template-columns:1fr 1fr 1.2fr; gap:2px; padding:4px; height:38px;
+            border:1px solid rgba(255,255,255,.2); border-radius:7px;
+            background:rgba(38,39,42,.86); box-shadow:0 2px 7px rgba(0,0,0,.2);
+            color:#f1f1f1; pointer-events:auto; font:13px/1.2 Arial,"Microsoft YaHei",sans-serif;
+            letter-spacing:0; text-shadow:none; user-select:none; }
+          #danmaku-plus1-toolbar[hidden] { display:none; }
+          #danmaku-plus1-toolbar button { appearance:none; box-sizing:border-box; margin:0;
+            padding:0 3px; min-width:0; border:0; border-radius:4px; background:transparent;
+            color:inherit; font:inherit; letter-spacing:0; white-space:nowrap; cursor:pointer; }
+          #danmaku-plus1-toolbar button:hover:not(:disabled) { background:rgba(255,255,255,.12); }
+          #danmaku-plus1-toolbar button:active:not(:disabled) { background:rgba(255,255,255,.2); }
+          #danmaku-plus1-toolbar button:focus-visible { outline:1px solid #fff; outline-offset:-1px; }
+          #danmaku-plus1-toolbar button:disabled { color:rgba(255,255,255,.36); cursor:default; }
+        `;
+        document.documentElement.appendChild(toolbarStyle);
+        toolbarLayer = document.createElement('div');
+        toolbarLayer.id = 'danmaku-plus1-layer';
+        toolbar = document.createElement('div');
+        toolbar.id = 'danmaku-plus1-toolbar';
+        toolbar.setAttribute('role', 'toolbar');
+        toolbar.setAttribute('aria-label', '弹幕操作');
+        toolbar.hidden = true;
+        for (const [action, label] of [['reply', '回复'], ['copy', '复制'], ['repeat', '复读+1']]) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.dataset.action = action;
+          button.textContent = label;
+          button.title = action === 'reply' ? '回复（暂未开放）' : label;
+          button.disabled = action === 'reply';
+          toolbar.appendChild(button);
+        }
+        toolbarLayer.appendChild(toolbar);
+        for (const type of ['pointerdown', 'mousedown', 'dblclick', 'contextmenu']) {
+          toolbar.addEventListener(type, (event) => {
+            event.stopPropagation();
+            if (type === 'contextmenu') event.preventDefault();
+          });
+        }
+        toolbar.addEventListener('click', async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const button = event.target.closest('button');
+          const owner = held;
+          if (!button || !owner || button.disabled) return;
+          const text = String(owner.dm.textData.text || '').trim();
+          if (!text) return;
+          button.disabled = true;
+          try {
+            if (button.dataset.action === 'copy') {
+              await copyDanmaku(text);
+              if (held === owner) button.textContent = '已复制';
+            } else {
+              await repeatDanmaku(text);
+            }
+          } catch (error) {
+            console.error('[Danmaku +1] Copy failed:', error);
+            showToast('复制失败');
+          } finally {
+            button.disabled = false;
+          }
+        });
+      }
+      const player = engine.layerWrap?.parentElement || engine.config.container.parentElement;
+      if (toolbarLayer.parentElement !== player) player.appendChild(toolbarLayer);
+      if (toolbarOwner !== held) {
+        toolbarOwner = held;
+        toolbar.querySelector('[data-action="copy"]').textContent = '复制';
+      }
+    }
+
+    function positionToolbar(engine) {
+      ensureToolbar(engine);
+      const root = toolbarLayer.getBoundingClientRect();
+      const area = engine.config.container.getBoundingClientRect();
+      const dm = held.element.getBoundingClientRect();
+      const scaleX = root.width / toolbarLayer.offsetWidth || 1;
+      const scaleY = root.height / toolbarLayer.offsetHeight || 1;
+      const left = Math.max(root.left, area.left, 0) + 6;
+      const right = Math.min(root.right, area.right, window.innerWidth) - 6;
+      const top = Math.max(root.top, area.top, 0) + 6;
+      const bottom = Math.min(root.bottom, area.bottom, window.innerHeight) - 6;
+      const width = Math.min(202 * scaleX, right - left);
+      const height = 38 * scaleY;
+      if (width < 160 * scaleX || bottom - top < height) {
+        toolbar.hidden = true;
+        toolbarBridge = null;
+        return;
+      }
+      const x = Math.max(left, Math.min(held.anchorX - width / 2, right - width));
+      const below = dm.bottom + 6;
+      const above = dm.top - 6 - height;
+      const y = Math.max(top, Math.min(below + height <= bottom ? below : above, bottom - height));
+      toolbar.style.width = `${width / scaleX}px`;
+      toolbar.style.left = `${(x - root.left) / scaleX}px`;
+      toolbar.style.top = `${(y - root.top) / scaleY}px`;
+      toolbar.dataset.placement = y >= dm.bottom ? 'bottom' : 'top';
+      toolbar.hidden = false;
+      toolbarBridge = { left: x, right: x + width,
+        top: Math.min(dm.bottom, y + height), bottom: Math.max(dm.top, y) };
+    }
+
+    function overToolbar() {
+      if (!toolbar || toolbar.hidden || !pointer) return false;
+      if (toolbar.contains(document.elementFromPoint(pointer.x, pointer.y))) return true;
+      return toolbarBridge && pointer.x >= toolbarBridge.left && pointer.x <= toolbarBridge.right
+        && pointer.y >= toolbarBridge.top && pointer.y <= toolbarBridge.bottom;
+    }
 
     // LiveDanmakuEngine is loaded asynchronously. Hook before the player calls
     // onSelect so we can reach the existing engine without creating another one.
@@ -238,6 +362,8 @@
 
     function release() {
       contextMenu = null;
+      if (toolbar) toolbar.hidden = true;
+      toolbarBridge = null;
       if (!held) return;
       const state = held;
       held = null;
@@ -266,7 +392,8 @@
       const preventExpiry = () => false;
       dm.mouseEnter();
       dm.shouldDestroy = preventExpiry;
-      held = { dm, manager, element, times, ownShouldDestroy, preventExpiry, startedAt: manager.renderTime };
+      held = { dm, manager, element, times, ownShouldDestroy, preventExpiry,
+        startedAt: manager.renderTime, anchorX: pointer.x, leaveAt: 0 };
     }
 
     function keepForContextMenu(engine) {
@@ -304,8 +431,22 @@
       if (held) {
         const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
         if (engine && held.manager.visualArray.includes(held.dm)
-          && held.dm.element === held.element && held.element.isConnected
-          && (keepForContextMenu(engine) || (containsPoint(held.element) && isOverPlayer(engine)))) return;
+          && held.dm.element === held.element && held.element.isConnected) {
+          if (keepForContextMenu(engine)) {
+            if (toolbar) toolbar.hidden = true;
+            toolbarBridge = null;
+            held.leaveAt = 0;
+            return;
+          }
+          positionToolbar(engine);
+          if (overToolbar() || (containsPoint(held.element) && isOverPlayer(engine))) {
+            held.leaveAt = 0;
+            return;
+          }
+          // Allow a short diagonal movement from the text to the bounded toolbar.
+          if (!held.leaveAt) held.leaveAt = performance.now() + 180;
+          if (performance.now() < held.leaveAt) return;
+        }
         release();
       }
       for (const engine of engines) {
@@ -327,6 +468,7 @@
           const style = getComputedStyle(dm.element);
           if (style.visibility !== 'visible' || Number(style.opacity) === 0) continue;
           hold(dm, manager);
+          if (held) positionToolbar(engine);
           return;
         }
       }
@@ -358,6 +500,7 @@
       if (!event.relatedTarget) reset();
     }, true);
     document.addEventListener('contextmenu', (event) => {
+      if (toolbar?.contains(event.target)) return;
       contextMenu = null;
       pointer = { x: event.clientX, y: event.clientY };
       checkHover();
