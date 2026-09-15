@@ -117,6 +117,80 @@ async (page) => {
   check(true, 'leaving the player restores danmaku');
 
   await page.evaluate(() => {
+    engine.danmaku.core.clear();
+    const menu = document.createElement('ul');
+    menu.id = 'hover-context-menu';
+    menu.style.cssText = 'position:absolute;top:80px;left:30px;background:white;opacity:0';
+    document.getElementById('player').append(menu);
+    engine.onSelect(items => {
+      setTimeout(() => {
+        menu.innerHTML = '<li data-auto-remove="1"><span></span><ul style="position:absolute;left:100%;top:0;background:white"><li>复制弹幕</li></ul></li><li><span>视频统计信息</span></li>';
+        menu.querySelector('span').textContent = items[0].text;
+        menu.style.opacity = '1';
+      }, 60);
+    });
+    document.cookie = 'bili_jct=test-only; path=/';
+    window.menuSent = [];
+    window.fetch = async (url, options) => { menuSent.push(options.body.get('msg')); return {ok:true,json:async()=>({code:0})}; };
+    window.closeHoverMenu = () => { menu.style.opacity = '0'; };
+    document.body.addEventListener('mousedown', event => {
+      if (!menu.contains(event.target)) closeHoverMenu();
+    });
+    addDm('Menu fixed', 5);
+  });
+  await page.waitForFunction(() => dmState('Menu fixed')?.className.includes('show'));
+  const menuFixed = await state('Menu fixed');
+  await page.mouse.move(menuFixed.x + menuFixed.width / 2, menuFixed.y + menuFixed.height / 2);
+  await page.waitForFunction(() => dmState('Menu fixed')?.hover);
+  await page.mouse.click(menuFixed.x + menuFixed.width / 2, menuFixed.y + menuFixed.height / 2, { button: 'right' });
+  await page.waitForFunction(() => document.querySelector('#hover-context-menu')?.style.opacity === '1');
+  await page.locator('#hover-context-menu > li').first().hover();
+  await page.waitForTimeout(3600);
+  check(!!(await state('Menu fixed'))?.hover, 'fixed danmaku stays alive while using its right-click menu');
+  await page.evaluate(() => closeHoverMenu());
+  await page.waitForFunction(() => !dmState('Menu fixed')?.hover);
+  check((await state('Menu fixed')).life > 1, 'opacity-only menu close releases the fixed danmaku with remaining time');
+
+  await page.mouse.move(400, 300);
+  await page.evaluate(() => addDm('Menu rolling', 1));
+  await page.waitForFunction(() => { const dm = dmState('Menu rolling'); return dm && dm.x > 200 && dm.x + dm.width < 930; });
+  const menuRoll = await state('Menu rolling');
+  await page.mouse.move(menuRoll.x + menuRoll.width / 2, menuRoll.y + menuRoll.height / 2);
+  await page.waitForFunction(() => dmState('Menu rolling')?.hover);
+  await page.mouse.click(menuRoll.x + menuRoll.width / 2, menuRoll.y + menuRoll.height / 2, { button: 'right' });
+  await page.waitForFunction(() => document.querySelector('#hover-context-menu [data-plus1-text]')?.dataset.plus1Text === 'Menu rolling');
+  await page.locator('#hover-context-menu ul > li').hover();
+  const heldInMenu = await state('Menu rolling');
+  await page.waitForTimeout(800);
+  check(Math.abs((await state('Menu rolling')).x - heldInMenu.x) < 1, 'rolling danmaku stays still while hovering its submenu');
+  await page.locator('#hover-context-menu [data-plus1-injected]').click();
+  await page.waitForFunction(() => !dmState('Menu rolling')?.hover);
+  check(await page.evaluate(() => menuSent[0] === 'Menu rolling'), 'clicking plus-one sends the held danmaku and releases it when the menu closes');
+
+  await page.mouse.move(400, 300);
+  await page.evaluate(() => addDm('Menu stay hovered', 5));
+  await page.waitForFunction(() => dmState('Menu stay hovered')?.className.includes('show'));
+  const stay = await state('Menu stay hovered');
+  await page.mouse.move(stay.x + stay.width / 2, stay.y + stay.height / 2);
+  await page.waitForFunction(() => dmState('Menu stay hovered')?.hover);
+  await page.mouse.click(stay.x + stay.width / 2, stay.y + stay.height / 2, { button: 'right' });
+  await page.waitForFunction(() => document.querySelector('#hover-context-menu [data-plus1-text]')?.dataset.plus1Text === 'Menu stay hovered');
+  await page.waitForTimeout(100);
+  await page.evaluate(() => document.getElementById('hover-context-menu').remove());
+  await page.waitForTimeout(150);
+  check(!!(await state('Menu stay hovered'))?.hover, 'closing menu keeps pause when the pointer remains over the danmaku');
+  await page.mouse.move(400, 300);
+  await page.waitForFunction(() => !dmState('Menu stay hovered')?.hover);
+  check(true, 'leaving after menu removal restores normal hover behavior');
+  await page.evaluate(() => engine.onSelect(() => {}));
+  await page.mouse.move(stay.x + stay.width / 2, stay.y + stay.height / 2);
+  await page.waitForFunction(() => dmState('Menu stay hovered')?.hover);
+  await page.mouse.click(stay.x + stay.width / 2, stay.y + stay.height / 2, { button: 'right' });
+  await page.mouse.move(400, 300);
+  await page.waitForFunction(() => !dmState('Menu stay hovered')?.hover);
+  check(true, 'missing context menu cannot leave a permanent pause');
+
+  await page.evaluate(() => {
     const menu = document.createElement('ul');
     menu.id = 'context-menu';
     menu.style.cssText = 'position:absolute;top:80px;left:30px;background:white';

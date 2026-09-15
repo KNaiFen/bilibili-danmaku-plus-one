@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.2.0
+// @version      1.2.1
 // @description  悬停暂停单条直播弹幕，移开后继续；右键菜单点击+1复读选中弹幕
 // @author       You
 // @match        https://live.bilibili.com/*
@@ -191,6 +191,7 @@
     const patched = new WeakSet();
     let pointer = null;
     let held = null;
+    let contextMenu = null;
     let frame = 0;
     let lastCheck = 0;
 
@@ -236,6 +237,7 @@
     }
 
     function release() {
+      contextMenu = null;
       if (!held) return;
       const state = held;
       held = null;
@@ -267,12 +269,43 @@
       held = { dm, manager, element, times, ownShouldDestroy, preventExpiry, startedAt: manager.renderTime };
     }
 
+    function keepForContextMenu(engine) {
+      if (!contextMenu) return false;
+      const isOpen = (menu) => {
+        if (!menu.isConnected || !menu.getClientRects().length) return false;
+        const style = getComputedStyle(menu);
+        return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0;
+      };
+      if (!contextMenu.menu) {
+        // The player's contextmenu handler creates selection entries after ours.
+        const player = engine.layerWrap?.parentElement || engine.config.container.parentElement;
+        const entries = player?.querySelectorAll('li[data-auto-remove="1"]') || [];
+        for (const entry of entries) {
+          const menu = entry.parentElement;
+          if (menu?.tagName === 'UL' && isOpen(menu)
+            && extractItemMainLabel(entry) === normalizeText(held.dm.textData.text)) {
+            contextMenu.menu = menu;
+            contextMenu.entry = entry;
+            break;
+          }
+        }
+        if (!contextMenu.menu) {
+          if (performance.now() < contextMenu.deadline) return true;
+          contextMenu = null;
+          return false;
+        }
+      }
+      if (isOpen(contextMenu.menu) && contextMenu.entry.parentElement === contextMenu.menu) return true;
+      contextMenu = null;
+      return false;
+    }
+
     function checkHover() {
       if (held) {
         const engine = Array.from(engines).find((entry) => managerOf(entry) === held.manager);
         if (engine && held.manager.visualArray.includes(held.dm)
-          && held.dm.element === held.element && containsPoint(held.element)
-          && isOverPlayer(engine)) return;
+          && held.dm.element === held.element && held.element.isConnected
+          && (keepForContextMenu(engine) || (containsPoint(held.element) && isOverPlayer(engine)))) return;
         release();
       }
       for (const engine of engines) {
@@ -324,7 +357,13 @@
     document.addEventListener('pointerout', (event) => {
       if (!event.relatedTarget) reset();
     }, true);
-    document.addEventListener('contextmenu', release, true);
+    document.addEventListener('contextmenu', (event) => {
+      contextMenu = null;
+      pointer = { x: event.clientX, y: event.clientY };
+      checkHover();
+      if (held) contextMenu = { menu: null, entry: null, deadline: performance.now() + 500 };
+      if (!frame) frame = requestAnimationFrame(tick);
+    }, true);
     document.addEventListener('visibilitychange', () => { if (document.hidden) reset(); });
     window.addEventListener('blur', reset);
     window.addEventListener('pagehide', () => {
