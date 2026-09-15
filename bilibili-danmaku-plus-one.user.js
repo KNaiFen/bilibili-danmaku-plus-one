@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.3.0
+// @version      1.3.1
 // @description  悬停暂停单条直播弹幕并显示复制、复读浮窗；支持右键菜单+1复读
 // @author       You
 // @match        https://live.bilibili.com/*
@@ -211,9 +211,9 @@
         toolbarStyle.textContent = `
           #danmaku-plus1-layer { position:absolute; inset:0; pointer-events:none; z-index:2147483646; }
           #danmaku-plus1-toolbar { position:absolute; box-sizing:border-box; display:grid;
-            grid-template-columns:1fr 1fr 1.2fr; gap:2px; padding:4px; height:38px;
-            border:1px solid rgba(255,255,255,.2); border-radius:7px;
-            background:rgba(38,39,42,.86); box-shadow:0 2px 7px rgba(0,0,0,.2);
+            grid-template-columns:1fr 1fr 1.2fr; gap:1px; padding:2px; height:30px;
+            border:1px solid rgba(255,255,255,.16); border-radius:6px;
+            background:rgba(38,39,42,.65); box-shadow:0 2px 5px rgba(0,0,0,.14);
             color:#f1f1f1; pointer-events:auto; font:13px/1.2 Arial,"Microsoft YaHei",sans-serif;
             letter-spacing:0; text-shadow:none; user-select:none; }
           #danmaku-plus1-toolbar[hidden] { display:none; }
@@ -292,9 +292,9 @@
       const right = Math.min(root.right, area.right, window.innerWidth) - 6;
       const top = Math.max(root.top, area.top, 0) + 6;
       const bottom = Math.min(root.bottom, area.bottom, window.innerHeight) - 6;
-      const width = Math.min(202 * scaleX, right - left);
-      const height = 38 * scaleY;
-      if (width < 160 * scaleX || bottom - top < height) {
+      const width = Math.min(160 * scaleX, right - left);
+      const height = 30 * scaleY;
+      if (width < 154 * scaleX || bottom - top < height) {
         toolbar.hidden = true;
         toolbarBridge = null;
         return;
