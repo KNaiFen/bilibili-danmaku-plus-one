@@ -28,7 +28,8 @@ async (page) => {
     core.manager.renderTime = 0;
     core.manager.currentTime = 0;
     window.addDm = (id, mode) => {
-      core.add({ text: id, mode, dmid: id, size: 25, color: 16777215, stime: core.manager.currentTime * 1000 });
+      // The manager's cached time can stop advancing while the engine is idle.
+      core.add({ text: id, mode, dmid: id, size: 25, color: 16777215, stime: core.config.fn.timelineSync() * 1000 });
     };
     window.dmState = id => {
       const dm = core.manager.visualArray.find(item => item.textData.dmid === id);
@@ -159,7 +160,7 @@ async (page) => {
   await page.waitForFunction(() => dmState('Menu rolling')?.hover);
   await page.mouse.click(menuRoll.x + menuRoll.width / 2, menuRoll.y + menuRoll.height / 2, { button: 'right' });
   await page.waitForFunction(() => document.querySelector('#hover-context-menu [data-plus1-text]')?.dataset.plus1Text === 'Menu rolling');
-  await page.locator('#hover-context-menu ul > li').hover();
+  await page.locator('#hover-context-menu ul > li').first().hover();
   const heldInMenu = await state('Menu rolling');
   await page.waitForTimeout(800);
   check(Math.abs((await state('Menu rolling')).x - heldInMenu.x) < 1, 'rolling danmaku stays still while hovering its submenu');
@@ -196,13 +197,15 @@ async (page) => {
     menu.style.cssText = 'position:absolute;top:80px;left:30px;background:white';
     menu.innerHTML = '<li data-plus1-injected="1" data-plus1-hooked="1" data-plus1-text="+1 弹幕复读"><span>+1 弹幕复读</span></li><li><span>视频统计信息</span></li>';
     document.getElementById('player').append(menu);
-    window.showSelection = text => {
+    window.showSelection = texts => {
       menu.querySelectorAll('[data-auto-remove]').forEach(item => item.remove());
-      const item = document.createElement('li');
-      item.dataset.autoRemove = '1';
-      item.innerHTML = '<span></span><ul style="display:none"><li>举报选中弹幕</li><li>复制弹幕</li></ul>';
-      item.querySelector('span').textContent = text;
-      menu.prepend(item);
+      for (const text of (Array.isArray(texts) ? texts : [texts]).slice().reverse()) {
+        const item = document.createElement('li');
+        item.dataset.autoRemove = '1';
+        item.innerHTML = '<span></span><ul style="display:none"><li class="submenu-item disabled">举报选中弹幕</li><li class="submenu-item">复制弹幕</li></ul>';
+        item.querySelector('span').textContent = text;
+        menu.prepend(item);
+      }
     };
     document.cookie = 'bili_jct=test-only; path=/';
     window.sent = [];
@@ -213,7 +216,11 @@ async (page) => {
   check(true, 'stale plus-one button is removed from a normal menu');
   await page.evaluate(() => showSelection('First selected danmaku'));
   await page.waitForFunction(() => document.querySelector('[data-plus1-text]')?.dataset.plus1Text === 'First selected danmaku');
-  check(await page.locator('[data-plus1-injected]').count() === 1, 'one first-level button appears before opening the hidden submenu');
+  check(await page.locator('#context-menu > li > ul > [data-plus1-injected]').count() === 1
+    && await page.locator('#context-menu > [data-plus1-injected]').count() === 0,
+  'repeat appears only inside the selected danmaku submenu, including while hidden');
+  check(await page.locator('[data-plus1-injected]').getAttribute('class') === 'submenu-item',
+    'repeat inherits the native copy submenu style without disabled report styling');
   await page.evaluate(() => showSelection('Second selected danmaku'));
   await page.waitForFunction(() => document.querySelector('[data-plus1-text]')?.dataset.plus1Text === 'Second selected danmaku');
   // DOM click avoids the real player's hit-test listener replacing this synthetic selection.
@@ -226,6 +233,55 @@ async (page) => {
   await page.waitForFunction(() => !!document.querySelector('[data-plus1-injected]'));
   await page.evaluate(() => document.querySelector('[data-plus1-injected]').click());
   check(await page.evaluate(() => sent[1] === '+1 弹幕复读'), 'a real danmaku matching the button label remains valid');
+
+  for (const index of [1, 0]) {
+    await page.waitForTimeout(400);
+    await page.evaluate(() => showSelection(['Nearby first', 'Nearby second']));
+    await page.waitForFunction(() => document.querySelectorAll('#context-menu > li > ul > [data-plus1-injected]').length === 2);
+    check(await page.evaluate(() => [...document.querySelectorAll('#context-menu > li[data-auto-remove]')]
+      .every(item => item.querySelectorAll('[data-plus1-injected]').length === 1)),
+    `both nearby danmaku have their own repeat button before choosing index ${index}`);
+    await page.evaluate(index => document.querySelectorAll('#context-menu > li > ul > [data-plus1-injected]')[index].click(), index);
+    check(await page.evaluate(index => sent[sent.length - 1] === ['Nearby first', 'Nearby second'][index], index),
+      `submenu ${index} repeats its own text even when closing destroys both selections`);
+    await page.waitForFunction(() => !document.querySelector('[data-plus1-injected]'));
+  }
+
+  await page.evaluate(() => {
+    showSelection(['Same text', 'Same text']);
+    const stale = document.createElement('li');
+    stale.dataset.plus1Injected = '1';
+    document.getElementById('context-menu').append(stale);
+  });
+  await page.waitForFunction(() => document.querySelectorAll('[data-plus1-injected]').length === 2
+    && !document.querySelector('#context-menu > [data-plus1-injected]'));
+  check(true, 'identical labels keep independent submenu buttons and old main-menu buttons are removed');
+  await page.evaluate(() => {
+    const first = document.querySelector('#context-menu > li[data-auto-remove]');
+    first.querySelector('span').textContent = 'Updated in place';
+    const button = first.querySelector('[data-plus1-injected]');
+    button.after(button.cloneNode(true));
+  });
+  await page.waitForFunction(() => document.querySelectorAll('[data-plus1-injected]').length === 2
+    && document.querySelector('[data-plus1-injected]').dataset.plus1Text === 'Updated in place');
+  check(true, 'submenu updates refresh the matching text and remove duplicate buttons');
+  await page.waitForTimeout(400);
+  await page.evaluate(() => document.querySelector('[data-plus1-injected]').click());
+  check(await page.evaluate(() => sent[sent.length - 1] === 'Updated in place'), 'reused submenu reads its current parent label when clicked');
+
+  await page.evaluate(() => {
+    showSelection('Lazy submenu');
+    document.querySelector('#context-menu > li[data-auto-remove] > ul').remove();
+  });
+  await page.waitForTimeout(80);
+  check(await page.locator('[data-plus1-injected]').count() === 0, 'no main-menu fallback is added before a submenu exists');
+  await page.evaluate(() => {
+    const submenu = document.createElement('ul');
+    submenu.innerHTML = '<li>复制弹幕</li>';
+    document.querySelector('#context-menu > li[data-auto-remove]').append(submenu);
+  });
+  await page.waitForFunction(() => document.querySelector('#context-menu > li > ul > [data-plus1-injected]')?.dataset.plus1Text === 'Lazy submenu');
+  check(true, 'a submenu created later receives its own repeat button');
 
   await page.mouse.move(1100, 600);
   await page.evaluate(() => {

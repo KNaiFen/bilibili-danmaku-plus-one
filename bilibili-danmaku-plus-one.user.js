@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili直播弹幕+1复读按钮
 // @namespace    https://greasyfork.org/
-// @version      1.4.0
+// @version      1.4.1
 // @description  悬停暂停单条直播弹幕并显示回复、复制、复读浮窗；回复复用B站原生@TA
 // @author       You
 // @match        https://live.bilibili.com/*
@@ -72,24 +72,17 @@
   function ensurePlusOneMenuItem() {
     // Player marks selected-danmaku entries with data-auto-remove, even before
     // their submenu is hovered. Never infer a selection from a normal menu item.
-    const menus = new Set();
-    document.querySelectorAll('li[data-auto-remove="1"], li[' + INJECTED_ATTR + ']').forEach((item) => {
-      if (item.parentElement?.tagName === 'UL') menus.add(item.parentElement);
-    });
-    for (const menu of menus) {
-      const anchor = findDanmakuAnchorInMainMenu(menu);
+    const activeItems = new Set();
+    for (const anchor of document.querySelectorAll('li[data-auto-remove="1"]')) {
+      if (anchor.hasAttribute(INJECTED_ATTR) || anchor.parentElement?.tagName !== 'UL') continue;
+      const menu = Array.from(anchor.children).find((child) => child.tagName === 'UL');
       const text = extractItemMainLabel(anchor);
-      const existing = Array.from(menu.children).filter((item) => item.hasAttribute(INJECTED_ATTR));
-      if (!anchor || !text) {
-        existing.forEach((item) => item.remove());
-        continue;
-      }
+      if (!menu || !text) continue;
       const template = Array.from(menu.children).find((item) =>
         item.tagName === 'LI' && !item.hasAttribute(INJECTED_ATTR)
-        && extractItemMainLabel(item) === '视频统计信息');
+        && extractItemMainLabel(item) === '复制弹幕');
       if (!template) continue;
-      let plusItem = existing.shift();
-      existing.forEach((item) => item.remove());
+      let plusItem = Array.from(menu.children).find((item) => item.hasAttribute(INJECTED_ATTR));
       if (!plusItem) {
         plusItem = template.cloneNode(true);
         plusItem.setAttribute(INJECTED_ATTR, '1');
@@ -101,9 +94,14 @@
       }
       plusItem.className = template.className;
       plusItem.setAttribute('data-plus1-text', text);
-      if (anchor.nextElementSibling !== plusItem) menu.insertBefore(plusItem, anchor.nextSibling);
+      if (template.nextElementSibling !== plusItem) menu.insertBefore(plusItem, template.nextSibling);
       hookPlusItem(plusItem);
+      activeItems.add(plusItem);
     }
+    // Remove duplicates, obsolete selections and buttons from the old main menu.
+    document.querySelectorAll('li[' + INJECTED_ATTR + ']').forEach((item) => {
+      if (!activeItems.has(item)) item.remove();
+    });
   }
 
   function hookPlusItem(itemEl) {
@@ -231,7 +229,9 @@
 
   function resolveDanmakuText(itemEl) {
     const menu = itemEl?.parentElement;
-    return menu ? extractItemMainLabel(findDanmakuAnchorInMainMenu(menu)) : '';
+    const anchor = menu?.parentElement;
+    return menu?.tagName === 'UL' && anchor?.matches('li[data-auto-remove="1"]')
+      && anchor.parentElement?.tagName === 'UL' ? extractItemMainLabel(anchor) : '';
   }
 
   function setPrimaryLabelText(itemEl, text) {
@@ -248,12 +248,6 @@
       return;
     }
     itemEl.textContent = text;
-  }
-
-  function findDanmakuAnchorInMainMenu(mainMenu) {
-    return Array.from(mainMenu.children).find((item) =>
-      item.tagName === 'LI' && item.getAttribute('data-auto-remove') === '1'
-      && !item.hasAttribute(INJECTED_ATTR)) || null;
   }
 
   function extractItemMainLabel(itemEl) {
