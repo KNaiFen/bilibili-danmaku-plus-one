@@ -10,5 +10,11 @@ out/
 .env.*
 !.env.example
 config.local.*
+*.bundle
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
 .DS_Store
 Thumbs.db
