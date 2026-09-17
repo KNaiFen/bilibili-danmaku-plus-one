@@ -2,7 +2,7 @@
 // @name         Bilibili直播弹幕一键 复读+1 浮窗
 // @namespace    https://greasyfork.org/
 // @version      1.6.1
-// @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗
+// @description  仿斗鱼样式：鼠标放到弹幕上显示可一键复读的按键浮窗，带自动复读功能
 // @author       You
 // @match        https://live.bilibili.com/*
 // @run-at       document-start
